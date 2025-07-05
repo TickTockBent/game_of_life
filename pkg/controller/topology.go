@@ -70,12 +70,21 @@ func GetNeighborPositions(position int) map[string]int {
 	return neighbors
 }
 
-// RegisterNode assigns a position to a new node
+// RegisterNode assigns a position to a new node, allowing re-registration
 func (t *Topology) RegisterNode(podID, endpoint string) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	
-	// Find first available position
+	// Check if this pod is already registered (re-registration)
+	for position, node := range t.nodes {
+		if node.PodID == podID {
+			// Update endpoint in case it changed
+			node.Endpoint = endpoint
+			return position, nil
+		}
+	}
+	
+	// Find first available position for new nodes
 	for position := 0; position < RegionSize*RegionSize; position++ {
 		if _, exists := t.nodes[position]; !exists {
 			pos := IndexToPosition(position)

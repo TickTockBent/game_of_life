@@ -5,24 +5,24 @@ class GameOfLifeVisualizer {
         this.cellSize = 10;
         this.gridData = null;
         this.topology = null;
-        this.isPlaying = false;
+        this.lastUpdateTime = Date.now();
         
         this.setupEventListeners();
         this.refreshData();
         
-        // Auto-refresh every second when playing
+        // Auto-refresh every second (simulation runs continuously)
         setInterval(() => {
-            if (this.isPlaying) {
-                this.refreshData();
-            }
+            this.refreshData();
+        }, 1000);
+        
+        // Update timing display every second
+        setInterval(() => {
+            this.updateTimingDisplay();
         }, 1000);
     }
     
     setupEventListeners() {
-        // Control buttons
-        document.getElementById('playBtn').addEventListener('click', () => this.play());
-        document.getElementById('pauseBtn').addEventListener('click', () => this.pause());
-        document.getElementById('stepBtn').addEventListener('click', () => this.step());
+        // Control buttons (removed play/pause/step)
         document.getElementById('clearBtn').addEventListener('click', () => this.clearAll());
         document.getElementById('randomBtn').addEventListener('click', () => this.randomizeAll());
         document.getElementById('refreshBtn').addEventListener('click', () => this.refreshData());
@@ -38,12 +38,26 @@ class GameOfLifeVisualizer {
             
             this.gridData = data.grids;
             this.topology = data.topology;
+            this.lastUpdateTime = Date.now();
             
             this.updateStatus();
             this.updateNodeInfo();
             this.draw();
         } catch (error) {
             console.error('Failed to refresh data:', error);
+        }
+    }
+    
+    updateTimingDisplay() {
+        const secondsAgo = Math.floor((Date.now() - this.lastUpdateTime) / 1000);
+        const lastUpdateElement = document.getElementById('lastUpdate');
+        
+        if (secondsAgo === 0) {
+            lastUpdateElement.textContent = 'Just now';
+        } else if (secondsAgo === 1) {
+            lastUpdateElement.textContent = '1 second ago';
+        } else {
+            lastUpdateElement.textContent = `${secondsAgo} seconds ago`;
         }
     }
     
@@ -170,25 +184,7 @@ class GameOfLifeVisualizer {
         }
     }
     
-    async play() {
-        // Send start command to all nodes
-        await this.sendCommandToAllNodes('/start');
-        this.isPlaying = true;
-        this.updateControlButtons();
-    }
-    
-    async pause() {
-        // Send stop command to all nodes
-        await this.sendCommandToAllNodes('/stop');
-        this.isPlaying = false;
-        this.updateControlButtons();
-    }
-    
-    async step() {
-        // Send step command to all nodes
-        await this.sendCommandToAllNodes('/step');
-        setTimeout(() => this.refreshData(), 100);
-    }
+    // Removed play/pause/step methods - simulation runs continuously
     
     async clearAll() {
         // For now, just randomize with 0 probability
@@ -213,11 +209,7 @@ class GameOfLifeVisualizer {
         await Promise.all(promises);
     }
     
-    updateControlButtons() {
-        document.getElementById('playBtn').disabled = this.isPlaying;
-        document.getElementById('pauseBtn').disabled = !this.isPlaying;
-        document.getElementById('stepBtn').disabled = this.isPlaying;
-    }
+    // Removed updateControlButtons - no longer needed without play/pause controls
 }
 
 // Initialize the visualizer when the page loads

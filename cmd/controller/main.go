@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/ticktockbent/game_of_life/pkg/controller"
@@ -35,13 +36,53 @@ type TopologyResponse struct {
 func NewController() *Controller {
 	regionID := os.Getenv("REGION_ID")
 	if regionID == "" {
-		regionID = "default"
+		regionID = "k3s-cluster"
 	}
 
-	return &Controller{
+	c := &Controller{
 		topology: controller.NewTopology(),
 		regionID: regionID,
 	}
+	
+	// Start aggressive health checking
+	go c.healthCheckLoop()
+	
+	return c
+}
+
+// healthCheckLoop continuously checks all nodes and removes unhealthy ones
+func (c *Controller) healthCheckLoop() {
+	ticker := time.NewTicker(1 * time.Second) // Check every second
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		c.checkAllNodesHealth()
+	}
+}
+
+// checkAllNodesHealth checks each node and removes unresponsive ones
+func (c *Controller) checkAllNodesHealth() {
+	nodes := c.topology.GetAllNodes()
+	
+	for position, node := range nodes {
+		if !c.isNodeHealthy(node) {
+			log.Printf("Removing unhealthy node %s at position %d", node.PodID, position)
+			c.topology.UnregisterNode(position)
+		}
+	}
+}
+
+// isNodeHealthy checks if a node responds to health check within timeout
+func (c *Controller) isNodeHealthy(node *controller.NodeInfo) bool {
+	client := &http.Client{Timeout: 500 * time.Millisecond} // Very aggressive 500ms timeout
+	
+	resp, err := client.Get(node.Endpoint + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	
+	return resp.StatusCode == 200
 }
 
 func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
