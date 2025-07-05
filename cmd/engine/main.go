@@ -21,6 +21,8 @@ type Engine struct {
 	ticker         *time.Ticker
 	controllerURL  string
 	selfEndpoint   string
+	position       int
+	registered     bool
 }
 
 type GridStateResponse struct {
@@ -57,7 +59,103 @@ func NewEngine() *Engine {
 		engine.distributedGrid = grid.NewDistributedGrid(controllerURL, selfEndpoint)
 	}
 	
+	// Start periodic health checking if configured for distributed mode
+	if controllerURL != "" && selfEndpoint != "" {
+		go engine.healthCheckLoop()
+	}
+	
 	return engine
+}
+
+// healthCheckLoop periodically verifies registration with controller
+func (e *Engine) healthCheckLoop() {
+	ticker := time.NewTicker(5 * time.Second) // Check every 5 seconds (less aggressive than controller)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		e.verifyRegistration()
+	}
+}
+
+// verifyRegistration checks if we're still registered and re-registers if needed
+func (e *Engine) verifyRegistration() {
+	if e.controllerURL == "" || e.selfEndpoint == "" {
+		return
+	}
+	
+	// Check if controller is reachable and if we're still registered
+	if !e.isControllerHealthy() || !e.isRegisteredWithController() {
+		log.Printf("Lost connection to controller, attempting re-registration...")
+		e.registered = false
+		e.attemptRegistration()
+	}
+}
+
+// isControllerHealthy checks if controller responds to health check
+func (e *Engine) isControllerHealthy() bool {
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, err := client.Get(e.controllerURL + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// isRegisteredWithController verifies our registration status
+func (e *Engine) isRegisteredWithController() bool {
+	if !e.registered {
+		return false
+	}
+	
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("%s/node/%d", e.controllerURL, e.position))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	
+	return resp.StatusCode == 200
+}
+
+// attemptRegistration tries to register with the controller
+func (e *Engine) attemptRegistration() {
+	if e.distributedGrid == nil {
+		e.distributedGrid = grid.NewDistributedGrid(e.controllerURL, e.selfEndpoint)
+	}
+	
+	if err := e.distributedGrid.Register(e.nodeID); err != nil {
+		log.Printf("Failed to re-register with controller: %v", err)
+		e.registered = false
+	} else {
+		e.position = e.distributedGrid.GetPosition()
+		e.registered = true
+		log.Printf("Successfully re-registered with controller at position %d", e.position)
+		
+		// Auto-start after re-registration
+		e.startSimulation()
+	}
+}
+
+// startSimulation starts the Game of Life simulation
+func (e *Engine) startSimulation() {
+	if e.running {
+		return // Already running
+	}
+	
+	e.running = true
+	e.ticker = time.NewTicker(100 * time.Millisecond)
+	
+	go func() {
+		for range e.ticker.C {
+			if !e.running {
+				break
+			}
+			e.grid.NextGeneration()
+		}
+	}()
+	
+	log.Printf("Auto-started simulation for continuous display")
 }
 
 func (e *Engine) handleGetState(w http.ResponseWriter, r *http.Request) {
@@ -190,9 +288,15 @@ func main() {
 	if engine.distributedGrid != nil {
 		if err := engine.distributedGrid.Register(engine.nodeID); err != nil {
 			log.Printf("Failed to register with controller: %v", err)
+			engine.registered = false
 			// Continue running in standalone mode
 		} else {
-			log.Printf("Registered with controller at position %d", engine.distributedGrid.GetPosition())
+			engine.position = engine.distributedGrid.GetPosition()
+			engine.registered = true
+			log.Printf("Registered with controller at position %d", engine.position)
+			
+			// Auto-start the simulation for continuous public display
+			engine.startSimulation()
 		}
 	}
 	
