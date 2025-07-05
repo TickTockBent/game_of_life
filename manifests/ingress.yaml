@@ -1,0 +1,53 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gameoflife-ingress
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+  annotations:
+    # Traefik specific annotations
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    # External DNS for your domain
+    external-dns.alpha.kubernetes.io/hostname: gameoflife.ticktockbent.com
+spec:
+  rules:
+  - host: gameoflife.ticktockbent.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-web
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - gameoflife.ticktockbent.com
+    secretName: gameoflife-tls
+
+---
+# Alternative ingress for local/cluster access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gameoflife-local
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+  - host: gameoflife.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-web
+            port:
+              number: 80
