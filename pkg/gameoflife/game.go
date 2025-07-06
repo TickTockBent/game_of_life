@@ -104,7 +104,48 @@ func (g *Grid) checkHaloNeighbor(x, y int) bool {
 	return false
 }
 
+// ComputeNextGeneration calculates the next generation but doesn't commit it yet
+func (g *Grid) ComputeNextGeneration() {
+	for x := 0; x < GridSize; x++ {
+		for y := 0; y < GridSize; y++ {
+			neighbors := g.countNeighbors(x, y)
+			
+			// Apply Conway's Game of Life rules
+			if g.Cells[x][y].Alive {
+				g.NextGen[x][y].Alive = neighbors == 2 || neighbors == 3
+			} else {
+				g.NextGen[x][y].Alive = neighbors == 3
+			}
+		}
+	}
+}
+
+// CommitNextGeneration commits the computed next generation
+func (g *Grid) CommitNextGeneration() {
+	// Copy NextGen to Cells and increment generation
+	g.Cells = g.NextGen
+	g.Generation++
+	
+	// Update boring threshold tracking
+	if g.isEmpty() {
+		g.emptyGenerations++
+		if g.emptyGenerations >= g.boringThreshold {
+			g.RandomSeed(0.3) // Auto-randomize when boring
+			g.emptyGenerations = 0
+		}
+	} else {
+		g.emptyGenerations = 0
+	}
+}
+
+// NextGeneration keeps backward compatibility (compute + commit in one call)
 func (g *Grid) NextGeneration() {
+	g.ComputeNextGeneration()
+	g.CommitNextGeneration()
+}
+
+// Legacy implementation for reference (now replaced by ComputeNextGeneration)
+func (g *Grid) nextGenerationLegacy() {
 	
 	for x := 0; x < GridSize; x++ {
 		for y := 0; y < GridSize; y++ {

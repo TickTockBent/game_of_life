@@ -47,7 +47,8 @@ func NewEngine() *Engine {
 		nodeID = "standalone"
 	}
 	
-	controllerURL := os.Getenv("CONTROLLER_URL")
+	// Always use external controller URL for global connectivity
+	controllerURL := "http://gameoflife.ticktockbent.com"
 	selfEndpoint := os.Getenv("SELF_ENDPOINT")
 	
 	engine := &Engine{
@@ -140,42 +141,49 @@ func (e *Engine) attemptRegistration() {
 		// Discover neighbors and enable crosstalk
 		e.discoverNeighbors()
 		
-		// Start simple loop after re-registration
-		e.startSimpleLoop()
+		// Start barrier sync loop after re-registration
+		e.startBarrierSyncLoop()
 	}
 }
 
-// startSimpleLoop starts a simple timer-based Game of Life simulation (lock-free)
-func (e *Engine) startSimpleLoop() {
+// startBarrierSyncLoop starts barrier-synchronized Game of Life simulation
+func (e *Engine) startBarrierSyncLoop() {
 	if e.running {
 		return // Already running
 	}
 	
 	e.running = true
-	e.ticker = time.NewTicker(200 * time.Millisecond) // Slower pace for now
 	
 	go func() {
-		for range e.ticker.C {
-			if !e.running {
-				break
-			}
-			
+		for e.running {
 			// 1. Poll neighbors for edge state (quick HTTP calls)
 			e.pollNeighborEdges()
 			
-			// 2. Compute and immediately commit next generation (no locks = no blocking)
+			// 2. Compute next generation but don't commit yet
 			emptyBefore := e.grid.GetEmptyGenerations()
-			e.grid.NextGeneration()
+			e.grid.ComputeNextGeneration() // New method - compute but don't commit
 			
-			// Check boring threshold
-			emptyAfter := e.grid.GetEmptyGenerations()
-			if emptyBefore >= 99 && emptyAfter == 0 {
-				log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+			// 3. Signal ready to controller
+			if e.signalReady() {
+				// 4. Wait for step command from controller
+				if e.waitForStep() {
+					// 5. Commit the computed generation
+					e.grid.CommitNextGeneration() // New method - commit the computed state
+					
+					// Check boring threshold
+					emptyAfter := e.grid.GetEmptyGenerations()
+					if emptyBefore >= 99 && emptyAfter == 0 {
+						log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+					}
+				}
 			}
+			
+			// Small delay to prevent tight loops on errors
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 	
-	log.Printf("Started simple lock-free simulation loop")
+	log.Printf("Started barrier-synchronized simulation loop")
 }
 
 // pollNeighborEdges fetches current edge state from all neighbors
@@ -270,7 +278,7 @@ func (e *Engine) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	e.startSimpleLoop()
+	e.startBarrierSyncLoop()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -438,8 +446,8 @@ func main() {
 			// Discover neighbors and enable crosstalk
 			engine.discoverNeighbors()
 			
-			// Start simple lock-free simulation
-			engine.startSimpleLoop()
+			// Start barrier-synchronized simulation
+			engine.startBarrierSyncLoop()
 		}
 	}
 	
@@ -462,4 +470,47 @@ func (e *Engine) neighborDiscoveryLoop() {
 			e.discoverNeighbors()
 		}
 	}
+}
+
+// signalReady signals to controller that this node is ready for next step
+func (e *Engine) signalReady() bool {
+	if !e.registered {
+		return false
+	}
+	
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, err := client.Post(
+		fmt.Sprintf("%s/ready/%d", e.controllerURL, e.position),
+		"application/json",
+		nil,
+	)
+	if err != nil {
+		log.Printf("Failed to signal ready: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	
+	return resp.StatusCode == 200
+}
+
+// waitForStep waits for controller to broadcast step command
+func (e *Engine) waitForStep() bool {
+	client := &http.Client{Timeout: 15 * time.Second} // Longer timeout for coordination
+	resp, err := client.Get(e.controllerURL + "/wait-step")
+	if err != nil {
+		log.Printf("Failed to wait for step: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode == 200 {
+		var stepCmd map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&stepCmd); err == nil {
+			if stepCmd["command"] == "step" {
+				return true
+			}
+		}
+	}
+	
+	return false
 }

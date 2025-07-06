@@ -1,0 +1,72 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gameoflife-controller-ingress
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+    component: controller
+  annotations:
+    traefik.ingress.kubernetes.io/router.priority: "5"
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: gameoflife.ticktockbent.com
+    http:
+      paths:
+      - path: /register
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /topology
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /neighbors
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /node
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /health
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /ready
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /wait-step
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081

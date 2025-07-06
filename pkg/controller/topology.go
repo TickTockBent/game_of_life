@@ -20,12 +20,14 @@ type NodeInfo struct {
 
 type Topology struct {
 	nodes map[int]*NodeInfo // position -> node info
+	readyNodes map[int]bool  // position -> ready status for barrier sync
 	mu    sync.RWMutex
 }
 
 func NewTopology() *Topology {
 	return &Topology{
 		nodes: make(map[int]*NodeInfo),
+		readyNodes: make(map[int]bool),
 	}
 }
 
@@ -145,4 +147,52 @@ func (t *Topology) GetNeighbors(position int) map[string]*NodeInfo {
 	}
 	
 	return neighbors
+}
+
+// MarkNodeReady marks a node as ready for the next step
+func (t *Topology) MarkNodeReady(position int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	// Only mark ready if node exists
+	if _, exists := t.nodes[position]; exists {
+		t.readyNodes[position] = true
+	}
+}
+
+// AreAllNodesReady checks if all registered nodes are ready
+func (t *Topology) AreAllNodesReady() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	
+	for position := range t.nodes {
+		if !t.readyNodes[position] {
+			return false
+		}
+	}
+	return true
+}
+
+// ResetReadyStatus clears all ready flags for the next cycle
+func (t *Topology) ResetReadyStatus() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	
+	for position := range t.readyNodes {
+		t.readyNodes[position] = false
+	}
+}
+
+// GetReadyCount returns the number of ready nodes
+func (t *Topology) GetReadyCount() (int, int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	
+	readyCount := 0
+	for _, ready := range t.readyNodes {
+		if ready {
+			readyCount++
+		}
+	}
+	return readyCount, len(t.nodes)
 }
