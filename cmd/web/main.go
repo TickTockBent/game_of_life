@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -148,7 +147,7 @@ func (w *WebServer) handleGridState(rw http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(rw).Encode(response)
 }
 
-// Handle cell click - forward to appropriate node
+// Handle grid click - randomize the clicked grid
 func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 	var req CellClickRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -156,66 +155,181 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Cell click: global (%d, %d)", req.GlobalX, req.GlobalY)
+	log.Printf("Grid click: global (%d, %d)", req.GlobalX, req.GlobalY)
 
-	// Calculate which node owns this cell (simplified - assumes 7x7 grids)
-	// Global coordinates to grid position
+	// Get topology first to find the correct node mapping
+	topologyResp, err := http.Get(w.controllerURL + "/topology")
+	if err != nil {
+		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
+		return
+	}
+	defer topologyResp.Body.Close()
+
+	var topology map[string]interface{}
+	if err := json.NewDecoder(topologyResp.Body).Decode(&topology); err != nil {
+		http.Error(rw, "Failed to parse topology", http.StatusInternalServerError)
+		return
+	}
+
+	nodes, ok := topology["nodes"].(map[string]interface{})
+	if !ok {
+		http.Error(rw, "Invalid topology format", http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate which grid section was clicked
 	gridX := req.GlobalX / 7
 	gridY := req.GlobalY / 7
-	position := gridY*10 + gridX // 10x10 grid of nodes
 
-	// Local coordinates within the node's grid
-	localX := req.GlobalX % 7
-	localY := req.GlobalY % 7
+	log.Printf("Randomizing grid section (%d, %d)", gridX, gridY)
 
-	log.Printf("Calculated: grid (%d, %d) -> position %d, local (%d, %d)", gridX, gridY, position, localX, localY)
-
-	// Get node info from controller
-	nodeResp, err := http.Get(fmt.Sprintf("%s/node/%d", w.controllerURL, position))
-	if err != nil {
-		http.Error(rw, "Node not found", http.StatusNotFound)
-		return
-	}
-	defer nodeResp.Body.Close()
-
-	if nodeResp.StatusCode != 200 {
-		http.Error(rw, "Node not found", http.StatusNotFound)
-		return
-	}
-
-	var nodeInfo map[string]interface{}
-	if err := json.NewDecoder(nodeResp.Body).Decode(&nodeInfo); err != nil {
-		http.Error(rw, "Failed to parse node info", http.StatusInternalServerError)
-		return
+	// Find the node that matches this grid position
+	var targetNode map[string]interface{}
+	
+	for _, nodeInterface := range nodes {
+		if nodeMap, ok := nodeInterface.(map[string]interface{}); ok {
+			if position, ok := nodeMap["position"].(map[string]interface{}); ok {
+				if row, rowOk := position["row"].(float64); rowOk {
+					if col, colOk := position["col"].(float64); colOk {
+						if int(row) == gridY && int(col) == gridX {
+							targetNode = nodeMap
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 
-	endpoint, ok := nodeInfo["endpoint"].(string)
+	if targetNode == nil {
+		log.Printf("No node found for grid position (%d, %d)", gridX, gridY)
+		http.Error(rw, "No node found for that position", http.StatusNotFound)
+		return
+	}
+
+	// Use the found node directly
+	endpoint, ok := targetNode["endpoint"].(string)
 	if !ok {
 		http.Error(rw, "Invalid node endpoint", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Forwarding to endpoint: %s", endpoint)
+	podId, _ := targetNode["podId"].(string)
+	log.Printf("Randomizing grid for node %s at endpoint: %s", podId, endpoint)
 
-	// Forward cell update to the node
-	cellUpdate := map[string]interface{}{
-		"x":     localX,
-		"y":     localY,
-		"alive": req.Alive,
-	}
-
-	jsonBody, _ := json.Marshal(cellUpdate)
-	updateResp, err := http.Post(endpoint+"/cell", "application/json", 
-		bytes.NewBuffer(jsonBody))
+	// Send randomize command to the specific node
+	client := &http.Client{Timeout: 2 * time.Second}
+	randomizeResp, err := client.Post(endpoint+"/randomize", "application/json", nil)
 	if err != nil {
-		log.Printf("Failed to post to %s: %v", endpoint, err)
-		http.Error(rw, "Failed to update cell", http.StatusServiceUnavailable)
+		log.Printf("Failed to randomize %s: %v", podId, err)
+		http.Error(rw, "Failed to randomize grid", http.StatusServiceUnavailable)
 		return
 	}
-	defer updateResp.Body.Close()
+	defer randomizeResp.Body.Close()
 
-	log.Printf("Cell update response: %d", updateResp.StatusCode)
-	rw.WriteHeader(updateResp.StatusCode)
+	if randomizeResp.StatusCode == 200 {
+		log.Printf("Successfully randomized grid for %s", podId)
+		rw.WriteHeader(http.StatusOK)
+	} else {
+		log.Printf("Randomize failed for %s: %d", podId, randomizeResp.StatusCode)
+		http.Error(rw, "Failed to randomize grid", http.StatusServiceUnavailable)
+	}
+}
+
+// Handle randomize all - send randomize command to all nodes
+func (w *WebServer) handleRandomizeAll(rw http.ResponseWriter, r *http.Request) {
+	log.Printf("Randomizing all nodes...")
+	
+	// First get topology to know all nodes
+	topologyResp, err := http.Get(w.controllerURL + "/topology")
+	if err != nil {
+		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
+		return
+	}
+	defer topologyResp.Body.Close()
+
+	var topology map[string]interface{}
+	if err := json.NewDecoder(topologyResp.Body).Decode(&topology); err != nil {
+		http.Error(rw, "Failed to parse topology", http.StatusInternalServerError)
+		return
+	}
+
+	nodes, ok := topology["nodes"].(map[string]interface{})
+	if !ok {
+		http.Error(rw, "Invalid topology format", http.StatusInternalServerError)
+		return
+	}
+
+	// Send randomize command to all nodes with slight staggering to avoid overwhelming
+	type nodeResult struct {
+		nodeId string
+		err    error
+	}
+	
+	resultChan := make(chan nodeResult, len(nodes))
+	
+	// Stagger the requests slightly to avoid overwhelming the cluster
+	nodeCount := 0
+	for posStr, nodeInterface := range nodes {
+		// Add a small delay between requests
+		if nodeCount > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		nodeCount++
+		
+		go func(pos string, nodeIface interface{}) {
+			nodeMap, ok := nodeIface.(map[string]interface{})
+			if !ok {
+				resultChan <- nodeResult{pos, fmt.Errorf("invalid node format")}
+				return
+			}
+
+			endpoint, ok := nodeMap["endpoint"].(string)
+			if !ok {
+				resultChan <- nodeResult{pos, fmt.Errorf("invalid endpoint")}
+				return
+			}
+
+			podId, _ := nodeMap["podId"].(string)
+
+			// Send randomize command with timeout
+			client := &http.Client{Timeout: 2 * time.Second}
+			randomizeResp, err := client.Post(endpoint+"/randomize", "application/json", nil)
+			if err != nil {
+				log.Printf("Failed to randomize %s: %v", podId, err)
+				resultChan <- nodeResult{podId, err}
+				return
+			}
+			defer randomizeResp.Body.Close()
+
+			if randomizeResp.StatusCode == 200 {
+				log.Printf("Successfully randomized %s", podId)
+				resultChan <- nodeResult{podId, nil}
+			} else {
+				log.Printf("Randomize failed for %s: %d", podId, randomizeResp.StatusCode)
+				resultChan <- nodeResult{podId, fmt.Errorf("status %d", randomizeResp.StatusCode)}
+			}
+		}(posStr, nodeInterface)
+	}
+	
+	// Collect results
+	successCount := 0
+	for i := 0; i < len(nodes); i++ {
+		result := <-resultChan
+		if result.err == nil {
+			successCount++
+		}
+	}
+
+	log.Printf("Randomized %d/%d nodes successfully", successCount, len(nodes))
+	
+	response := map[string]interface{}{
+		"success": successCount,
+		"total":   len(nodes),
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(response)
 }
 
 func main() {
@@ -231,6 +345,7 @@ func main() {
 	r.HandleFunc("/api/topology", webServer.handleTopology).Methods("GET")
 	r.HandleFunc("/api/grid", webServer.handleGridState).Methods("GET")
 	r.HandleFunc("/api/click", webServer.handleCellClick).Methods("POST")
+	r.HandleFunc("/api/randomize", webServer.handleRandomizeAll).Methods("POST")
 	
 	// Main page
 	r.HandleFunc("/", webServer.handleIndex).Methods("GET")

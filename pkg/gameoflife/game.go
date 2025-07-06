@@ -229,7 +229,7 @@ func (g *Grid) SetNeighbors(neighbors map[string]string) {
 
 // fetchNeighborEdge retrieves edge data from a neighbor node
 func (g *Grid) fetchNeighborEdge(direction, endpoint string) []bool {
-	client := &http.Client{Timeout: 50 * time.Millisecond} // Very fast timeout for edge sync
+	client := &http.Client{Timeout: 20 * time.Millisecond} // Very aggressive timeout for edge sync
 	resp, err := client.Get(endpoint + "/edges/" + direction)
 	if err != nil {
 		return nil
@@ -248,23 +248,72 @@ func (g *Grid) fetchNeighborEdge(direction, endpoint string) []bool {
 	return edgeData
 }
 
-// updateHaloRegions fetches edge data from all neighbors
+// updateHaloRegions fetches edge data from all neighbors (non-blocking)
 func (g *Grid) updateHaloRegions() {
 	if !g.crosstalkEnabled {
 		return
 	}
 	
-	// Fetch halo data from neighbors
+	// Use shorter timeout and don't block the simulation if neighbors are slow
+	type haloUpdate struct {
+		direction string
+		data      []bool
+	}
+	
+	resultChan := make(chan haloUpdate, 4)
+	activeRequests := 0
+	
+	// Start async requests for each neighbor
 	if endpoint, exists := g.neighbors["north"]; exists {
-		g.haloNorth = g.fetchNeighborEdge("south", endpoint) // North neighbor's south edge
+		activeRequests++
+		go func() {
+			data := g.fetchNeighborEdge("south", endpoint)
+			resultChan <- haloUpdate{"north", data}
+		}()
 	}
 	if endpoint, exists := g.neighbors["south"]; exists {
-		g.haloSouth = g.fetchNeighborEdge("north", endpoint) // South neighbor's north edge
+		activeRequests++
+		go func() {
+			data := g.fetchNeighborEdge("north", endpoint)
+			resultChan <- haloUpdate{"south", data}
+		}()
 	}
 	if endpoint, exists := g.neighbors["east"]; exists {
-		g.haloEast = g.fetchNeighborEdge("west", endpoint) // East neighbor's west edge
+		activeRequests++
+		go func() {
+			data := g.fetchNeighborEdge("west", endpoint)
+			resultChan <- haloUpdate{"east", data}
+		}()
 	}
 	if endpoint, exists := g.neighbors["west"]; exists {
-		g.haloWest = g.fetchNeighborEdge("east", endpoint) // West neighbor's east edge
+		activeRequests++
+		go func() {
+			data := g.fetchNeighborEdge("east", endpoint)
+			resultChan <- haloUpdate{"west", data}
+		}()
+	}
+	
+	// Collect results with a timeout to avoid blocking
+	timeout := time.NewTimer(30 * time.Millisecond) // Very short timeout
+	defer timeout.Stop()
+	
+	for i := 0; i < activeRequests; i++ {
+		select {
+		case update := <-resultChan:
+			// Apply successful updates
+			switch update.direction {
+			case "north":
+				g.haloNorth = update.data
+			case "south":
+				g.haloSouth = update.data
+			case "east":
+				g.haloEast = update.data
+			case "west":
+				g.haloWest = update.data
+			}
+		case <-timeout.C:
+			// Don't wait forever - just use old halo data
+			return
+		}
 	}
 }
