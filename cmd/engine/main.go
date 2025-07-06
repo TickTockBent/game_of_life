@@ -23,6 +23,9 @@ type Engine struct {
 	selfEndpoint   string
 	position       int
 	registered     bool
+	neighbors      map[string]string
+	crosstalkEnabled bool
+	lastEmptyCount int // Track boring threshold resets
 }
 
 type GridStateResponse struct {
@@ -132,6 +135,9 @@ func (e *Engine) attemptRegistration() {
 		e.registered = true
 		log.Printf("Successfully re-registered with controller at position %d", e.position)
 		
+		// Discover neighbors and enable crosstalk
+		e.discoverNeighbors()
+		
 		// Auto-start after re-registration
 		e.startSimulation()
 	}
@@ -151,7 +157,17 @@ func (e *Engine) startSimulation() {
 			if !e.running {
 				break
 			}
+			
+			// Track empty generations for boring threshold detection
+			emptyBefore := e.grid.GetEmptyGenerations()
+			
 			e.grid.NextGeneration()
+			
+			// Check if boring threshold reset occurred (empty count went from high to 0)
+			emptyAfter := e.grid.GetEmptyGenerations()
+			if emptyBefore >= 99 && emptyAfter == 0 {
+				log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+			}
 		}
 	}()
 	
@@ -180,6 +196,7 @@ func (e *Engine) handleUpdateCell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	log.Printf("Setting cell (%d, %d) to %t", req.X, req.Y, req.Alive)
 	e.grid.SetCell(req.X, req.Y, req.Alive)
 	w.WriteHeader(http.StatusOK)
 }
@@ -196,7 +213,16 @@ func (e *Engine) handleStart(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for range e.ticker.C {
 			if e.running {
+				// Track empty generations for boring threshold detection
+				emptyBefore := e.grid.GetEmptyGenerations()
+				
 				e.grid.NextGeneration()
+				
+				// Check if boring threshold reset occurred
+				emptyAfter := e.grid.GetEmptyGenerations()
+				if emptyBefore >= 99 && emptyAfter == 0 {
+					log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+				}
 			}
 		}
 	}()
@@ -229,6 +255,7 @@ func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Randomizing grid with 30%% probability")
 	e.grid.RandomSeed(0.3)
 	w.WriteHeader(http.StatusOK)
 }
@@ -264,6 +291,52 @@ func (e *Engine) handleGetEdge(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(edgeData)
 }
 
+// discoverNeighbors queries the controller for neighbor endpoints
+func (e *Engine) discoverNeighbors() {
+	if e.controllerURL == "" || !e.registered {
+		return
+	}
+	
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("%s/neighbors/%d", e.controllerURL, e.position))
+	if err != nil {
+		log.Printf("Failed to discover neighbors: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		log.Printf("Failed to get neighbors, status: %d", resp.StatusCode)
+		return
+	}
+	
+	var neighbors map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&neighbors); err != nil {
+		log.Printf("Failed to decode neighbors: %v", err)
+		return
+	}
+	
+	// Extract neighbor endpoints
+	neighborEndpoints := make(map[string]string)
+	for direction, nodeInfo := range neighbors {
+		if nodeMap, ok := nodeInfo.(map[string]interface{}); ok {
+			if endpoint, exists := nodeMap["endpoint"]; exists {
+				if endpointStr, ok := endpoint.(string); ok {
+					neighborEndpoints[direction] = endpointStr
+				}
+			}
+		}
+	}
+	
+	e.neighbors = neighborEndpoints
+	e.crosstalkEnabled = len(neighborEndpoints) > 0
+	
+	// Configure the grid with neighbor endpoints
+	e.grid.SetNeighbors(neighborEndpoints)
+	
+	log.Printf("Discovered %d neighbors for edge crosstalk: %v", len(neighborEndpoints), neighborEndpoints)
+}
+
 func main() {
 	engine := NewEngine()
 	
@@ -278,6 +351,7 @@ func main() {
 	r.HandleFunc("/randomize", engine.handleRandomize).Methods("POST")
 	r.HandleFunc("/health", engine.handleHealth).Methods("GET")
 	r.HandleFunc("/edges/{direction}", engine.handleGetEdge).Methods("GET")
+	r.HandleFunc("/neighbors/refresh", engine.handleRefreshNeighbors).Methods("POST")
 	
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -295,11 +369,42 @@ func main() {
 			engine.registered = true
 			log.Printf("Registered with controller at position %d", engine.position)
 			
+			// Discover neighbors and enable crosstalk
+			engine.discoverNeighbors()
+			
 			// Auto-start the simulation for continuous public display
 			engine.startSimulation()
 		}
 	}
 	
+	// Periodic neighbor discovery to handle topology changes
+	if engine.distributedGrid != nil {
+		go engine.neighborDiscoveryLoop()
+	}
+	
 	log.Printf("Game of Life Engine starting on port %s (Node: %s)\n", port, engine.nodeID)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
+}
+
+// neighborDiscoveryLoop periodically refreshes neighbor information
+func (e *Engine) neighborDiscoveryLoop() {
+	ticker := time.NewTicker(10 * time.Second) // Refresh neighbors every 10 seconds
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		if e.registered {
+			e.discoverNeighbors()
+		}
+	}
+}
+
+// handleRefreshNeighbors manually triggers neighbor discovery
+func (e *Engine) handleRefreshNeighbors(w http.ResponseWriter, r *http.Request) {
+	e.discoverNeighbors()
+	response := map[string]interface{}{
+		"neighbors": e.neighbors,
+		"crosstalkEnabled": e.crosstalkEnabled,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

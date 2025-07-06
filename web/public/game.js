@@ -6,14 +6,15 @@ class GameOfLifeVisualizer {
         this.gridData = null;
         this.topology = null;
         this.lastUpdateTime = Date.now();
+        this.isUpdating = false; // Prevent concurrent updates
         
         this.setupEventListeners();
         this.refreshData();
         
-        // Auto-refresh every second (simulation runs continuously)
+        // Auto-refresh every 100ms for very smooth Game of Life visualization
         setInterval(() => {
             this.refreshData();
-        }, 1000);
+        }, 100);
         
         // Update timing display every second
         setInterval(() => {
@@ -103,6 +104,18 @@ class GameOfLifeVisualizer {
     draw() {
         if (!this.gridData || !this.topology) return;
         
+        // Auto-resize canvas based on grid dimensions
+        const maxRow = Math.max(...Object.values(this.topology.nodes).map(n => n.position.row)) + 1;
+        const maxCol = Math.max(...Object.values(this.topology.nodes).map(n => n.position.col)) + 1;
+        
+        const canvasWidth = maxCol * 7 * this.cellSize;
+        const canvasHeight = maxRow * 7 * this.cellSize;
+        
+        if (this.canvas.width !== canvasWidth || this.canvas.height !== canvasHeight) {
+            this.canvas.width = canvasWidth;
+            this.canvas.height = canvasHeight;
+        }
+        
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
         
         Object.entries(this.topology.nodes).forEach(([position, node]) => {
@@ -155,12 +168,23 @@ class GameOfLifeVisualizer {
     }
     
     async handleCanvasClick(event) {
+        if (this.isUpdating) {
+            return; // Prevent rapid clicks from interfering
+        }
+        
         const rect = this.canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
+        const scaleX = this.canvas.width / rect.width;   // Account for CSS scaling
+        const scaleY = this.canvas.height / rect.height;
+        
+        const x = (event.clientX - rect.left) * scaleX;
+        const y = (event.clientY - rect.top) * scaleY;
         
         const globalX = Math.floor(x / this.cellSize);
         const globalY = Math.floor(y / this.cellSize);
+        
+        console.log(`Click at canvas (${x.toFixed(1)}, ${y.toFixed(1)}) -> cell (${globalX}, ${globalY})`);
+        
+        this.isUpdating = true;
         
         try {
             const response = await fetch('/api/click', {
@@ -176,11 +200,19 @@ class GameOfLifeVisualizer {
             });
             
             if (response.ok) {
-                // Refresh the display after a short delay
-                setTimeout(() => this.refreshData(), 100);
+                console.log(`Successfully updated cell (${globalX}, ${globalY})`);
+                // Immediate refresh to show the change
+                setTimeout(() => this.refreshData(), 50);
+            } else {
+                console.error(`Failed to update cell: ${response.status} ${response.statusText}`);
             }
         } catch (error) {
             console.error('Failed to update cell:', error);
+        } finally {
+            // Allow new clicks after a short delay
+            setTimeout(() => {
+                this.isUpdating = false;
+            }, 200);
         }
     }
     
@@ -193,9 +225,11 @@ class GameOfLifeVisualizer {
     }
     
     async randomizeAll() {
+        console.log('Randomizing all nodes...');
         // Send randomize command to all nodes
         await this.sendCommandToAllNodes('/randomize');
-        setTimeout(() => this.refreshData(), 500);
+        // Immediate refresh to show the randomization
+        setTimeout(() => this.refreshData(), 100);
     }
     
     async sendCommandToAllNodes(command) {
