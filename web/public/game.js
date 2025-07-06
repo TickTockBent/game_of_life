@@ -182,7 +182,10 @@ class GameOfLifeVisualizer {
         const globalX = Math.floor(x / this.cellSize);
         const globalY = Math.floor(y / this.cellSize);
         
-        console.log(`Click at canvas (${x.toFixed(1)}, ${y.toFixed(1)}) -> cell (${globalX}, ${globalY})`);
+        const gridX = Math.floor(globalX / 7);
+        const gridY = Math.floor(globalY / 7);
+        
+        console.log(`Click at canvas (${x.toFixed(1)}, ${y.toFixed(1)}) -> cell (${globalX}, ${globalY}) -> randomizing grid (${gridX}, ${gridY})`);
         
         this.isUpdating = true;
         
@@ -195,19 +198,19 @@ class GameOfLifeVisualizer {
                 body: JSON.stringify({
                     globalX: globalX,
                     globalY: globalY,
-                    alive: true // Always set to alive for now, could add toggle logic
+                    alive: true // Not used anymore, just randomizes the grid
                 })
             });
             
             if (response.ok) {
-                console.log(`Successfully updated cell (${globalX}, ${globalY})`);
+                console.log(`Successfully randomized grid (${gridX}, ${gridY})`);
                 // Immediate refresh to show the change
                 setTimeout(() => this.refreshData(), 50);
             } else {
-                console.error(`Failed to update cell: ${response.status} ${response.statusText}`);
+                console.error(`Failed to randomize grid: ${response.status} ${response.statusText}`);
             }
         } catch (error) {
-            console.error('Failed to update cell:', error);
+            console.error('Failed to randomize grid:', error);
         } finally {
             // Allow new clicks after a short delay
             setTimeout(() => {
@@ -226,10 +229,25 @@ class GameOfLifeVisualizer {
     
     async randomizeAll() {
         console.log('Randomizing all nodes...');
-        // Send randomize command to all nodes
-        await this.sendCommandToAllNodes('/randomize');
-        // Immediate refresh to show the randomization
-        setTimeout(() => this.refreshData(), 100);
+        try {
+            const response = await fetch('/api/randomize', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            });
+            
+            if (response.ok) {
+                const result = await response.json();
+                console.log(`Randomized ${result.success}/${result.total} nodes successfully`);
+                // Immediate refresh to show the randomization
+                setTimeout(() => this.refreshData(), 100);
+            } else {
+                console.error(`Failed to randomize: ${response.status} ${response.statusText}`);
+            }
+        } catch (error) {
+            console.error('Failed to randomize all nodes:', error);
+        }
     }
     
     async sendCommandToAllNodes(command) {
