@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/ticktockbent/game_of_life/pkg/gameoflife"
 	"github.com/ticktockbent/game_of_life/pkg/grid"
 )
@@ -26,6 +30,11 @@ type Engine struct {
 	neighbors      map[string]string
 	crosstalkEnabled bool
 	lastEmptyCount int // Track boring threshold resets
+	
+	// WebSocket edge communication
+	neighborConns  map[string]*websocket.Conn
+	connMutex      sync.RWMutex
+	upgrader       websocket.Upgrader
 }
 
 type GridStateResponse struct {
@@ -39,6 +48,12 @@ type CellUpdateRequest struct {
 	X     int  `json:"x"`
 	Y     int  `json:"y"`
 	Alive bool `json:"alive"`
+}
+
+type EdgeUpdate struct {
+	Direction string `json:"direction"`
+	EdgeData  []bool `json:"edgeData"`
+	NodeID    string `json:"nodeId"`
 }
 
 func NewEngine() *Engine {
@@ -55,6 +70,12 @@ func NewEngine() *Engine {
 		nodeID:        nodeID,
 		controllerURL: controllerURL,
 		selfEndpoint:  selfEndpoint,
+		neighborConns: make(map[string]*websocket.Conn),
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow connections from any origin for distributed setup
+			},
+		},
 	}
 	
 	// Initialize distributed grid if controller URL is provided
@@ -130,6 +151,8 @@ func (e *Engine) attemptRegistration() {
 	if err := e.distributedGrid.Register(e.nodeID); err != nil {
 		log.Printf("Failed to re-register with controller: %v", err)
 		e.registered = false
+		// Health endpoint will now return unhealthy status, triggering k8s restart
+		log.Printf("Marking as unregistered - health checks will fail to trigger pod restart")
 	} else {
 		e.position = e.distributedGrid.GetPosition()
 		e.registered = true
@@ -138,45 +161,178 @@ func (e *Engine) attemptRegistration() {
 		// Discover neighbors and enable crosstalk
 		e.discoverNeighbors()
 		
-		// Auto-start after re-registration
-		e.startSimulation()
+		// Start barrier sync after re-registration
+		e.startBarrierSyncLoop()
 	}
 }
 
-// startSimulation starts the Game of Life simulation
-func (e *Engine) startSimulation() {
+// startBarrierSyncLoop starts the barrier-synchronized Game of Life simulation
+func (e *Engine) startBarrierSyncLoop() {
 	if e.running {
 		return // Already running
 	}
 	
 	e.running = true
-	e.ticker = time.NewTicker(100 * time.Millisecond)
 	
 	go func() {
-		for range e.ticker.C {
-			if !e.running {
-				break
-			}
+		for e.running {
+			// 1. Poll neighbors for current edge state
+			e.pollNeighborEdges()
 			
-			// Track empty generations for boring threshold detection
-			emptyBefore := e.grid.GetEmptyGenerations()
+			// 2. Compute next generation locally (no state change yet)
+			e.computeNextGeneration()
 			
-			e.grid.NextGeneration()
+			// 3. Signal ready to controller
+			e.signalReadyToController()
 			
-			// Check if boring threshold reset occurred (empty count went from high to 0)
-			emptyAfter := e.grid.GetEmptyGenerations()
-			if emptyBefore >= 99 && emptyAfter == 0 {
-				log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
-			}
+			// 4. Wait for controller's step command
+			e.waitForStepCommand()
+			
+			// 5. Atomically commit the new state
+			e.commitNextGeneration()
 		}
 	}()
 	
-	log.Printf("Auto-started simulation for continuous display")
+	log.Printf("Started barrier-synchronized simulation loop")
+}
+
+// pollNeighborEdges fetches current edge state from all neighbors
+func (e *Engine) pollNeighborEdges() {
+	if !e.crosstalkEnabled || len(e.neighbors) == 0 {
+		return
+	}
+	
+	for direction, endpoint := range e.neighbors {
+		// Get current edge state from neighbor
+		client := &http.Client{Timeout: 100 * time.Millisecond}
+		
+		// Determine which edge to request based on our position relative to neighbor
+		var requestDirection string
+		switch direction {
+		case "north":
+			requestDirection = "south" // Their south edge becomes our north halo
+		case "south":
+			requestDirection = "north" // Their north edge becomes our south halo
+		case "east":
+			requestDirection = "west"  // Their west edge becomes our east halo
+		case "west":
+			requestDirection = "east"  // Their east edge becomes our west halo
+		default:
+			continue
+		}
+		
+		resp, err := client.Get(endpoint + "/edges/" + requestDirection)
+		if err != nil {
+			// Neighbor not available, use empty edge data
+			continue
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == 200 {
+			var edgeData []bool
+			if err := json.NewDecoder(resp.Body).Decode(&edgeData); err == nil {
+				e.grid.UpdateHaloRegion(direction, edgeData)
+			}
+		}
+	}
+}
+
+// computeNextGeneration calculates the next state but doesn't commit it yet
+func (e *Engine) computeNextGeneration() {
+	// Track empty generations for boring threshold detection
+	emptyBefore := e.grid.GetEmptyGenerations()
+	
+	// Compute next generation (this modifies nextGen field, not current cells)
+	e.grid.NextGeneration()
+	
+	// Check if boring threshold reset occurred
+	emptyAfter := e.grid.GetEmptyGenerations()
+	if emptyBefore >= 99 && emptyAfter == 0 {
+		log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+	}
+}
+
+// signalReadyToController tells controller this engine is ready for next step
+func (e *Engine) signalReadyToController() {
+	if e.controllerURL == "" || !e.registered {
+		return
+	}
+	
+	// Signal ready to controller (this endpoint needs to be added to controller)
+	client := &http.Client{Timeout: 1 * time.Second}
+	readyData := map[string]interface{}{
+		"nodeId":   e.nodeID,
+		"position": e.position,
+		"generation": e.grid.GetGeneration(),
+	}
+	
+	data, _ := json.Marshal(readyData)
+	resp, err := client.Post(e.controllerURL+"/ready", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		log.Printf("Failed to signal ready to controller: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+}
+
+// waitForStepCommand waits for controller to broadcast step advance
+func (e *Engine) waitForStepCommand() {
+	if e.controllerURL == "" || !e.registered {
+		// In standalone mode, just advance after a delay
+		time.Sleep(200 * time.Millisecond)
+		return
+	}
+	
+	// Poll controller for step command (this could be optimized with WebSockets later)
+	client := &http.Client{Timeout: 5 * time.Second}
+	for {
+		resp, err := client.Get(fmt.Sprintf("%s/step-ready/%d", e.controllerURL, e.position))
+		if err != nil {
+			log.Printf("Failed to check step ready: %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == 200 {
+			// Controller says we can advance
+			break
+		}
+		
+		// Not ready yet, wait a bit and check again
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// commitNextGeneration atomically swaps in the computed next state
+func (e *Engine) commitNextGeneration() {
+	// This is where the actual state change happens
+	// Since we removed locks, this is just a simple assignment
+	e.grid.Cells = e.grid.NextGen
+	e.grid.Generation++
 }
 
 func (e *Engine) handleGetState(w http.ResponseWriter, r *http.Request) {
 	state, gen := e.grid.GetState()
 	edges := e.grid.GetEdgeCells()
+	
+	// Validate that we have a complete 7x7 grid to catch any partial reads
+	if len(state) != gameoflife.GridSize {
+		log.Printf("Invalid state: expected %d rows, got %d", gameoflife.GridSize, len(state))
+		// Return empty grid rather than potentially corrupted data
+		state = make([][gameoflife.GridSize]bool, gameoflife.GridSize)
+		gen = 0
+	} else {
+		for i, row := range state {
+			if len(row) != gameoflife.GridSize {
+				log.Printf("Invalid state: row %d expected %d columns, got %d", i, gameoflife.GridSize, len(row))
+				// Return empty grid rather than potentially corrupted data
+				state = make([][gameoflife.GridSize]bool, gameoflife.GridSize)
+				gen = 0
+				break
+			}
+		}
+	}
 	
 	response := GridStateResponse{
 		NodeID:     e.nodeID,
@@ -261,13 +417,23 @@ func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := map[string]interface{}{
-		"status": "healthy",
-		"nodeId": e.nodeID,
-		"generation": e.grid.GetGeneration(),
+	// Simple registration-based health check - no locks required
+	status := "healthy"
+	if e.controllerURL != "" {
+		// In distributed mode, health depends on registration status
+		if !e.registered {
+			status = "unhealthy"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 	}
 	
-	if e.distributedGrid != nil {
+	health := map[string]interface{}{
+		"status": status,
+		"nodeId": e.nodeID,
+		"registered": e.registered,
+	}
+	
+	if e.distributedGrid != nil && e.registered {
 		health["position"] = e.distributedGrid.GetPosition()
 	}
 	
@@ -334,6 +500,9 @@ func (e *Engine) discoverNeighbors() {
 	// Configure the grid with neighbor endpoints
 	e.grid.SetNeighbors(neighborEndpoints)
 	
+	// Establish WebSocket connections to neighbors
+	go e.connectToNeighbors()
+	
 	log.Printf("Discovered %d neighbors for edge crosstalk: %v", len(neighborEndpoints), neighborEndpoints)
 }
 
@@ -352,6 +521,7 @@ func main() {
 	r.HandleFunc("/health", engine.handleHealth).Methods("GET")
 	r.HandleFunc("/edges/{direction}", engine.handleGetEdge).Methods("GET")
 	r.HandleFunc("/neighbors/refresh", engine.handleRefreshNeighbors).Methods("POST")
+	r.HandleFunc("/ws/edges", engine.handleWebSocketEdges).Methods("GET")
 	
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -363,7 +533,8 @@ func main() {
 		if err := engine.distributedGrid.Register(engine.nodeID); err != nil {
 			log.Printf("Failed to register with controller: %v", err)
 			engine.registered = false
-			// Continue running in standalone mode
+			// Health endpoint will return unhealthy status, triggering k8s restart
+			log.Printf("Initial registration failed - health checks will fail to trigger pod restart")
 		} else {
 			engine.position = engine.distributedGrid.GetPosition()
 			engine.registered = true
@@ -372,8 +543,8 @@ func main() {
 			// Discover neighbors and enable crosstalk
 			engine.discoverNeighbors()
 			
-			// Auto-start the simulation for continuous public display
-			engine.startSimulation()
+			// Start barrier-synchronized simulation
+			engine.startBarrierSyncLoop()
 		}
 	}
 	
@@ -407,4 +578,150 @@ func (e *Engine) handleRefreshNeighbors(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleWebSocketEdges handles WebSocket connections for edge updates
+func (e *Engine) handleWebSocketEdges(w http.ResponseWriter, r *http.Request) {
+	conn, err := e.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+	
+	log.Printf("WebSocket edge connection established from %s", r.RemoteAddr)
+	
+	// Handle incoming edge updates
+	for {
+		var update EdgeUpdate
+		err := conn.ReadJSON(&update)
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket edge connection error: %v", err)
+			}
+			break
+		}
+		
+		// Apply the edge update to our grid's halo region
+		e.grid.UpdateHaloRegion(update.Direction, update.EdgeData)
+		log.Printf("Received edge update for %s from %s", update.Direction, update.NodeID)
+	}
+}
+
+// broadcastEdgeUpdates sends our edge data to all neighbor WebSocket connections
+func (e *Engine) broadcastEdgeUpdates() {
+	if !e.crosstalkEnabled {
+		return
+	}
+	
+	edges := e.grid.GetEdgeCells()
+	
+	e.connMutex.RLock()
+	defer e.connMutex.RUnlock()
+	
+	// Send appropriate edge data to each neighbor
+	for direction, conn := range e.neighborConns {
+		if conn == nil {
+			continue
+		}
+		
+		// Determine which edge to send based on neighbor direction
+		var edgeData []bool
+		var edgeDirection string
+		
+		switch direction {
+		case "north":
+			edgeData = edges["north"]
+			edgeDirection = "south" // Our north edge becomes their south halo
+		case "south":
+			edgeData = edges["south"]
+			edgeDirection = "north" // Our south edge becomes their north halo
+		case "east":
+			edgeData = edges["east"]
+			edgeDirection = "west" // Our east edge becomes their west halo
+		case "west":
+			edgeData = edges["west"]
+			edgeDirection = "east" // Our west edge becomes their east halo
+		default:
+			continue
+		}
+		
+		update := EdgeUpdate{
+			Direction: edgeDirection,
+			EdgeData:  edgeData,
+			NodeID:    e.nodeID,
+		}
+		
+		// Send update asynchronously to avoid blocking
+		go func(conn *websocket.Conn, direction string, update EdgeUpdate) {
+			err := conn.WriteJSON(update)
+			if err != nil {
+				log.Printf("Failed to send edge update to %s neighbor: %v", direction, err)
+				// Mark connection as failed - it will be reconnected later
+				e.connMutex.Lock()
+				e.neighborConns[direction] = nil
+				e.connMutex.Unlock()
+			}
+		}(conn, direction, update)
+	}
+}
+
+// connectToNeighbors establishes WebSocket connections to all discovered neighbors
+func (e *Engine) connectToNeighbors() {
+	if !e.crosstalkEnabled || len(e.neighbors) == 0 {
+		return
+	}
+	
+	e.connMutex.Lock()
+	defer e.connMutex.Unlock()
+	
+	for direction, endpoint := range e.neighbors {
+		// Skip if already connected
+		if e.neighborConns[direction] != nil {
+			continue
+		}
+		
+		// Convert HTTP endpoint to WebSocket URL
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			log.Printf("Failed to parse neighbor endpoint %s: %v", endpoint, err)
+			continue
+		}
+		
+		wsURL := fmt.Sprintf("ws://%s/ws/edges", u.Host)
+		
+		go func(direction, wsURL string) {
+			for {
+				conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+				if err != nil {
+					log.Printf("Failed to connect to %s neighbor at %s: %v", direction, wsURL, err)
+					time.Sleep(5 * time.Second) // Retry after 5 seconds
+					continue
+				}
+				
+				log.Printf("Connected to %s neighbor via WebSocket: %s", direction, wsURL)
+				
+				e.connMutex.Lock()
+				e.neighborConns[direction] = conn
+				e.connMutex.Unlock()
+				
+				// Monitor connection and reconnect if it fails
+				for {
+					_, _, err := conn.ReadMessage()
+					if err != nil {
+						log.Printf("WebSocket connection to %s lost: %v", direction, err)
+						conn.Close()
+						
+						e.connMutex.Lock()
+						e.neighborConns[direction] = nil
+						e.connMutex.Unlock()
+						
+						break // Will retry connection in outer loop
+					}
+				}
+				
+				time.Sleep(2 * time.Second) // Brief pause before reconnection
+			}
+		}(direction, wsURL)
+	}
 }
