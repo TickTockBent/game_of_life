@@ -22,10 +22,8 @@ type CellClickRequest struct {
 }
 
 func NewWebServer() *WebServer {
-	controllerURL := os.Getenv("CONTROLLER_URL")
-	if controllerURL == "" {
-		controllerURL = "http://localhost:9081"
-	}
+	// Always use external controller URL for global connectivity
+	controllerURL := "http://gameoflife.ticktockbent.com"
 
 	return &WebServer{
 		controllerURL: controllerURL,
