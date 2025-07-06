@@ -156,6 +156,8 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Cell click: global (%d, %d)", req.GlobalX, req.GlobalY)
+
 	// Calculate which node owns this cell (simplified - assumes 7x7 grids)
 	// Global coordinates to grid position
 	gridX := req.GlobalX / 7
@@ -165,6 +167,8 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 	// Local coordinates within the node's grid
 	localX := req.GlobalX % 7
 	localY := req.GlobalY % 7
+
+	log.Printf("Calculated: grid (%d, %d) -> position %d, local (%d, %d)", gridX, gridY, position, localX, localY)
 
 	// Get node info from controller
 	nodeResp, err := http.Get(fmt.Sprintf("%s/node/%d", w.controllerURL, position))
@@ -191,6 +195,8 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Forwarding to endpoint: %s", endpoint)
+
 	// Forward cell update to the node
 	cellUpdate := map[string]interface{}{
 		"x":     localX,
@@ -202,11 +208,13 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 	updateResp, err := http.Post(endpoint+"/cell", "application/json", 
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
+		log.Printf("Failed to post to %s: %v", endpoint, err)
 		http.Error(rw, "Failed to update cell", http.StatusServiceUnavailable)
 		return
 	}
 	defer updateResp.Body.Close()
 
+	log.Printf("Cell update response: %d", updateResp.StatusCode)
 	rw.WriteHeader(updateResp.StatusCode)
 }
 
