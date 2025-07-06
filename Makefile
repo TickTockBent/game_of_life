@@ -35,6 +35,9 @@ docker-push: docker-build
 docker-multiarch:
 	./scripts/build-multiarch.sh
 
+docker-fast:
+	./scripts/fast-build.sh
+
 setup-auth:
 	./scripts/setup-registry-auth.sh
 
