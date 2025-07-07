@@ -8,56 +8,51 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/ticktockbent/game_of_life/pkg/controller"
 )
 
+// Simple controller for star topology - just aggregates state and serves halo data
 type Controller struct {
-	topology *controller.Topology
-	regionID string
-	// Request tracking for overload detection
-	requestCounter  int64
-	registrations   int64
-	neighborLookups int64
-	healthChecks    int64
-	mu              sync.Mutex
-	lastStatsLog    time.Time
-	// Timing safeguards
-	lastStepTime    time.Time
-	nodeReadyTimes  map[int]time.Time
-	timingMu        sync.RWMutex
-	// Additional metrics
-	forceStepCount     int64
-	reregistPrompts    int64
-	reregistSuccesses  int64
-	reregistFailures   int64
-	// State aggregation
-	gridStates    map[int]*GridState
-	stateMu       sync.RWMutex
+	// Node registry
+	nodes      map[int]*NodeInfo
+	nodesMu    sync.RWMutex
+	nextPos    int
+	
+	// Grid state storage
+	gridStates map[int]*GridState
+	stateMu    sync.RWMutex
+	
+	// Generation counter for lazy sync
+	currentGeneration int64
+	generationMu      sync.RWMutex
+	
+	// Simple metrics
+	regionID   string
 }
 
+type NodeInfo struct {
+	PodID     string `json:"podId"`
+	Position  int    `json:"position"`
+	Endpoint  string `json:"endpoint"`
+	RegisteredAt time.Time `json:"registeredAt"`
+}
+
+type GridState struct {
+	Grid       [][]bool  `json:"grid"`
+	Generation int       `json:"generation"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+// Request/Response types
 type RegisterRequest struct {
 	PodID    string `json:"podId"`
 	Endpoint string `json:"endpoint"`
 }
 
 type RegisterResponse struct {
-	Position  int                  `json:"position"`
-	Neighbors map[string]int       `json:"neighbors"`
-}
-
-type TopologyResponse struct {
-	RegionID string                         `json:"regionId"`
-	Nodes    map[int]*controller.NodeInfo   `json:"nodes"`
-}
-
-type GridState struct {
-	Grid       [][]bool `json:"grid"`
-	Generation int      `json:"generation"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	Position int `json:"position"`
 }
 
 type StateUpdateRequest struct {
@@ -65,13 +60,18 @@ type StateUpdateRequest struct {
 	Generation int      `json:"generation"`
 }
 
+type TopologyResponse struct {
+	RegionID string              `json:"regionId"`
+	Nodes    map[int]*NodeInfo   `json:"nodes"`
+}
+
 type AggregatedStateResponse struct {
-	Topology *TopologyResponse            `json:"topology"`
-	Grids    map[string]*GridState        `json:"grids"`
+	Topology *TopologyResponse       `json:"topology"`
+	Grids    map[string]*GridState   `json:"grids"`
 }
 
 type HaloResponse struct {
-	HaloCells [9][9]bool `json:"haloCells"` // 9x9 grid with center 7x7 being the node's area
+	HaloCells [9][9]bool `json:"haloCells"`
 }
 
 func NewController() *Controller {
@@ -81,331 +81,79 @@ func NewController() *Controller {
 	}
 
 	c := &Controller{
-		topology: controller.NewTopology(),
-		regionID: regionID,
-		lastStatsLog: time.Now(),
-		lastStepTime: time.Now(),
-		nodeReadyTimes: make(map[int]time.Time),
-		gridStates: make(map[int]*GridState),
+		nodes:             make(map[int]*NodeInfo),
+		gridStates:        make(map[int]*GridState),
+		currentGeneration: 0,
+		regionID:          regionID,
 	}
 	
-	// Start request statistics logging
-	go c.statsLoop()
-	
-	// Start aggressive health checking
-	go c.healthCheckLoop()
-	
-	// Start barrier sync coordinator
-	go c.barrierSyncLoop()
+	// Start generation advancement timer
+	go c.generationAdvancer()
 	
 	return c
 }
 
-// healthCheckLoop continuously checks all nodes and removes unhealthy ones
-func (c *Controller) healthCheckLoop() {
-	ticker := time.NewTicker(3 * time.Second) // Less aggressive checking for external connectivity
+// generationAdvancer increments the global generation counter every 200ms
+func (c *Controller) generationAdvancer() {
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	
 	for range ticker.C {
-		c.checkAllNodesHealth()
+		c.generationMu.Lock()
+		c.currentGeneration++
+		c.generationMu.Unlock()
 	}
 }
 
-// checkAllNodesHealth checks each node and removes unresponsive ones
-func (c *Controller) checkAllNodesHealth() {
-	nodes := c.topology.GetAllNodes()
+// GET /generation - Return current generation for engines to sync against
+func (c *Controller) handleGeneration(w http.ResponseWriter, r *http.Request) {
+	c.generationMu.RLock()
+	gen := c.currentGeneration
+	c.generationMu.RUnlock()
 	
-	for position, node := range nodes {
-		if !c.isNodeHealthy(node) {
-			log.Printf("Removing unhealthy node %s at position %d", node.PodID, position)
-			c.topology.UnregisterNode(position)
-		}
+	response := map[string]interface{}{
+		"generation": gen,
 	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
-// isNodeHealthy checks if a node responds to health check within timeout
-func (c *Controller) isNodeHealthy(node *controller.NodeInfo) bool {
-	client := &http.Client{Timeout: 3 * time.Second} // More reasonable timeout for external routing
-	
-	resp, err := client.Get(node.Endpoint + "/health")
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	
-	return resp.StatusCode == 200
-}
-
-// barrierSyncLoop coordinates barrier synchronization by polling engines
-func (c *Controller) barrierSyncLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond) // Poll frequently for responsiveness
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		nodes := c.topology.GetAllNodes()
-		if len(nodes) == 0 {
-			continue
-		}
-		
-		// Poll all engines to check if they're ready
-		readyCount := c.checkAllEnginesReady(nodes)
-		
-		if readyCount == len(nodes) {
-			log.Printf("All %d nodes ready - broadcasting step", len(nodes))
-			c.broadcastStep(nodes)
-			c.updateLastStepTime()
-		} else {
-			// Check if we should force step due to timeout
-			c.timingMu.RLock()
-			lastStep := c.lastStepTime
-			c.timingMu.RUnlock()
-			
-			if time.Since(lastStep) > 1*time.Second {
-				atomic.AddInt64(&c.forceStepCount, 1)
-				log.Printf("Force stepping %d/%d ready nodes after 1s timeout", readyCount, len(nodes))
-				c.broadcastStepToReady(nodes)
-				c.updateLastStepTime()
-			}
-		}
-	}
-}
-
-// checkAllEnginesReady polls all engines' /ready endpoints and tracks timing
-func (c *Controller) checkAllEnginesReady(nodes map[int]*controller.NodeInfo) int {
-	readyCount := 0
-	now := time.Now()
-	
-	c.timingMu.Lock()
-	defer c.timingMu.Unlock()
-	
-	for position, node := range nodes {
-		if c.isEngineReady(node) {
-			readyCount++
-			c.nodeReadyTimes[position] = now // Update ready time
-		} else {
-			// Check if node has been unready too long
-			if lastReady, exists := c.nodeReadyTimes[position]; exists {
-				if now.Sub(lastReady) > 1*time.Second {
-					atomic.AddInt64(&c.reregistPrompts, 1)
-					log.Printf("Node %s unready for >1s, prompting re-registration", node.PodID)
-					c.promptReregistration(node)
-					delete(c.nodeReadyTimes, position) // Reset timer
-				}
-			}
-		}
-	}
-	
-	return readyCount
-}
-
-// isEngineReady checks if a specific engine is ready
-func (c *Controller) isEngineReady(node *controller.NodeInfo) bool {
-	client := &http.Client{Timeout: 1 * time.Second}
-	
-	resp, err := client.Get(node.Endpoint + "/ready")
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return false
-	}
-	
-	var readyResp map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&readyResp); err != nil {
-		return false
-	}
-	
-	ready, ok := readyResp["ready"].(bool)
-	return ok && ready
-}
-
-// broadcastStep sends step command to all engines
-func (c *Controller) broadcastStep(nodes map[int]*controller.NodeInfo) {
-	for _, node := range nodes {
-		go func(n *controller.NodeInfo) {
-			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Post(n.Endpoint+"/step", "application/json", nil)
-			if err != nil {
-				log.Printf("Failed to step node %s: %v", n.PodID, err)
-				return
-			}
-			defer resp.Body.Close()
-			
-			if resp.StatusCode != 200 {
-				log.Printf("Step failed for node %s: %d", n.PodID, resp.StatusCode)
-			}
-		}(node)
-	}
-}
-
-// requestLoggingMiddleware logs request patterns and detects overload
-func (c *Controller) requestLoggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		atomic.AddInt64(&c.requestCounter, 1)
-		
-		// Track specific endpoint types
-		switch {
-		case r.URL.Path == "/register":
-			atomic.AddInt64(&c.registrations, 1)
-		case r.URL.Path == "/health":
-			atomic.AddInt64(&c.healthChecks, 1)
-		case len(r.URL.Path) > 10 && r.URL.Path[:10] == "/neighbors":
-			atomic.AddInt64(&c.neighborLookups, 1)
-		}
-		
-		next.ServeHTTP(w, r)
-		
-		duration := time.Since(start)
-		if duration > 500*time.Millisecond {
-			log.Printf("SLOW REQUEST: %s %s took %v", r.Method, r.URL.Path, duration)
-		}
-	})
-}
-
-// statsLoop logs request statistics every 30 seconds
-func (c *Controller) statsLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		c.logRequestStats()
-	}
-}
-
-// logRequestStats prints current request load and detects overload patterns
-func (c *Controller) logRequestStats() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	now := time.Now()
-	duration := now.Sub(c.lastStatsLog)
-	c.lastStatsLog = now
-	
-	totalReqs := atomic.LoadInt64(&c.requestCounter)
-	regs := atomic.LoadInt64(&c.registrations)
-	health := atomic.LoadInt64(&c.healthChecks)
-	neighbors := atomic.LoadInt64(&c.neighborLookups)
-	
-	// Calculate rates per minute
-	minutes := duration.Minutes()
-	totalRate := float64(totalReqs) / minutes
-	regRate := float64(regs) / minutes
-	healthRate := float64(health) / minutes
-	neighborRate := float64(neighbors) / minutes
-	
-	log.Printf("REQUEST STATS: %.1f req/min (%.1f reg/min, %.1f health/min, %.1f neighbor/min) - %d nodes", 
-		totalRate, regRate, healthRate, neighborRate, len(c.topology.GetAllNodes()))
-	
-	// Detect potential overload patterns
-	if totalRate > 300 {
-		log.Printf("WARNING: High request rate detected (%.1f req/min)", totalRate)
-	}
-	if regRate > 20 {
-		log.Printf("WARNING: High registration churn detected (%.1f reg/min)", regRate)
-	}
-	
-	// Reset counters
-	atomic.StoreInt64(&c.requestCounter, 0)
-	atomic.StoreInt64(&c.registrations, 0)
-	atomic.StoreInt64(&c.healthChecks, 0)
-	atomic.StoreInt64(&c.neighborLookups, 0)
-}
-
+// POST /register - Assign position to new engine
 func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	c.nodesMu.Lock()
+	position := c.nextPos
+	c.nextPos++
 	
-	position, err := c.topology.RegisterNode(req.PodID, req.Endpoint)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	// Keep positions in 0-99 range for 10x10 grid
+	if position >= 100 {
+		c.nodesMu.Unlock()
+		http.Error(w, "Grid full", http.StatusServiceUnavailable)
 		return
 	}
 	
-	response := RegisterResponse{
-		Position:  position,
-		Neighbors: controller.GetNeighborPositions(position),
+	c.nodes[position] = &NodeInfo{
+		PodID:        req.PodID,
+		Position:     position,
+		Endpoint:     req.Endpoint,
+		RegisteredAt: time.Now(),
 	}
-	
+	c.nodesMu.Unlock()
+
+	response := RegisterResponse{Position: position}
 	log.Printf("Registered node %s at position %d", req.PodID, position)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-func (c *Controller) handleGetTopology(w http.ResponseWriter, r *http.Request) {
-	response := TopologyResponse{
-		RegionID: c.regionID,
-		Nodes:    c.topology.GetAllNodes(),
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (c *Controller) handleGetNode(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-	
-	node, exists := c.topology.GetNode(position)
-	if !exists {
-		http.Error(w, "Node not found at position", http.StatusNotFound)
-		return
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(node)
-}
-
-func (c *Controller) handleUnregister(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-	
-	c.topology.UnregisterNode(position)
-	log.Printf("Unregistered node at position %d", position)
-	
-	w.WriteHeader(http.StatusOK)
-}
-
-func (c *Controller) handleGetNeighbors(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-	
-	neighbors := c.topology.GetNeighbors(position)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(neighbors)
-}
-
-func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := map[string]interface{}{
-		"status":   "healthy",
-		"regionId": c.regionID,
-		"nodes":    len(c.topology.GetAllNodes()),
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
-}
-
-// handleStateUpdate receives state updates from engine pods
+// POST /state/{position} - Store grid state from engine
 func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	position, err := strconv.Atoi(vars["position"])
@@ -420,7 +168,6 @@ func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store the state update
 	c.stateMu.Lock()
 	c.gridStates[position] = &GridState{
 		Grid:       req.Grid,
@@ -432,15 +179,69 @@ func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleAggregatedState returns all current grid states for the web interface
-func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Request) {
-	// Get topology
-	topology := &TopologyResponse{
-		RegionID: c.regionID,
-		Nodes:    c.topology.GetAllNodes(),
+// GET /halo/{position} - Return 9x9 region around position for edge computation
+func (c *Controller) handleHaloRequest(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	position, err := strconv.Atoi(vars["position"])
+	if err != nil {
+		http.Error(w, "Invalid position", http.StatusBadRequest)
+		return
 	}
 
-	// Get all grid states, converting position int to string for JSON compatibility
+	// Calculate grid coordinates (10x10 layout)
+	row := position / 10
+	col := position % 10
+
+	var halo [9][9]bool
+
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+
+	// Build 9x9 halo with this position's 7x7 in center
+	for haloRow := 0; haloRow < 9; haloRow++ {
+		for haloCol := 0; haloCol < 9; haloCol++ {
+			// Center 7x7 comes from our own grid
+			if haloRow >= 1 && haloRow <= 7 && haloCol >= 1 && haloCol <= 7 {
+				gridRow := haloRow - 1
+				gridCol := haloCol - 1
+				if state, exists := c.gridStates[position]; exists &&
+					gridRow < len(state.Grid) && gridCol < len(state.Grid[gridRow]) {
+					halo[haloRow][haloCol] = state.Grid[gridRow][gridCol]
+				}
+			} else {
+				// Edge cells come from neighbors
+				neighborRow := row + (haloRow - 4)
+				neighborCol := col + (haloCol - 4)
+				
+				if neighborRow >= 0 && neighborRow < 10 && neighborCol >= 0 && neighborCol < 10 {
+					neighborPos := neighborRow*10 + neighborCol
+					if state, exists := c.gridStates[neighborPos]; exists {
+						// Map halo edge to neighbor's opposite edge
+						nRow := (haloRow + 3) % 7
+						nCol := (haloCol + 3) % 7
+						if nRow < len(state.Grid) && nCol < len(state.Grid[nRow]) {
+							halo[haloRow][haloCol] = state.Grid[nRow][nCol]
+						}
+					}
+				}
+			}
+		}
+	}
+
+	response := HaloResponse{HaloCells: halo}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// GET /aggregated-state - Return all grid states for web interface
+func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Request) {
+	c.nodesMu.RLock()
+	nodes := make(map[int]*NodeInfo)
+	for k, v := range c.nodes {
+		nodes[k] = v
+	}
+	c.nodesMu.RUnlock()
+
 	c.stateMu.RLock()
 	grids := make(map[string]*GridState)
 	for position, state := range c.gridStates {
@@ -449,149 +250,96 @@ func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Reques
 	c.stateMu.RUnlock()
 
 	response := &AggregatedStateResponse{
-		Topology: topology,
-		Grids:    grids,
+		Topology: &TopologyResponse{
+			RegionID: c.regionID,
+			Nodes:    nodes,
+		},
+		Grids: grids,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-// Old barrier sync handlers removed - now using polling approach
+// GET /topology - Return node positions
+func (c *Controller) handleTopology(w http.ResponseWriter, r *http.Request) {
+	c.nodesMu.RLock()
+	nodes := make(map[int]*NodeInfo)
+	for k, v := range c.nodes {
+		nodes[k] = v
+	}
+	c.nodesMu.RUnlock()
+
+	response := TopologyResponse{
+		RegionID: c.regionID,
+		Nodes:    nodes,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// GET /metrics - Simple system metrics
+func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	c.nodesMu.RLock()
+	nodeCount := len(c.nodes)
+	c.nodesMu.RUnlock()
+
+	c.stateMu.RLock()
+	stateCount := len(c.gridStates)
+	c.stateMu.RUnlock()
+
+	c.generationMu.RLock()
+	currentGen := c.currentGeneration
+	c.generationMu.RUnlock()
+
+	metrics := map[string]interface{}{
+		"timestamp":    time.Now().Unix(),
+		"regionId":     c.regionID,
+		"nodes":        nodeCount,
+		"activeGrids":  stateCount,
+		"generation":   currentGen,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+// GET /health - Health check
+func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
+	health := map[string]interface{}{
+		"status":   "healthy",
+		"regionId": c.regionID,
+		"nodes":    len(c.nodes),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
 
 func main() {
 	controller := NewController()
-	
+
 	r := mux.NewRouter()
-	
-	// Add request logging middleware
-	r.Use(controller.requestLoggingMiddleware)
-	
-	// Registration endpoints
+
+	// Core endpoints for simplified architecture
 	r.HandleFunc("/register", controller.handleRegister).Methods("POST")
-	r.HandleFunc("/node/{position}", controller.handleUnregister).Methods("DELETE")
-	
-	// Discovery endpoints
-	r.HandleFunc("/topology", controller.handleGetTopology).Methods("GET")
-	r.HandleFunc("/node/{position}", controller.handleGetNode).Methods("GET")
-	r.HandleFunc("/neighbors/{position}", controller.handleGetNeighbors).Methods("GET")
-	
-	// Health check
-	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
-	
-	// State aggregation endpoints
 	r.HandleFunc("/state/{position}", controller.handleStateUpdate).Methods("POST")
+	r.HandleFunc("/halo/{position}", controller.handleHaloRequest).Methods("GET")
+	r.HandleFunc("/generation", controller.handleGeneration).Methods("GET")
 	r.HandleFunc("/aggregated-state", controller.handleAggregatedState).Methods("GET")
-	
-	// Metrics endpoint
+	r.HandleFunc("/topology", controller.handleTopology).Methods("GET")
 	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
-	
-	// Removed old barrier sync endpoints - now using polling
-	
+	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
+
+	// Legacy API mapping for web interface
+	r.HandleFunc("/api/grid", controller.handleAggregatedState).Methods("GET")
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
 	}
-	
-	log.Printf("Game of Life Controller starting on port %s (Region: %s)\n", port, controller.regionID)
+
+	log.Printf("Simplified Game of Life Controller starting on port %s (Region: %s)", port, controller.regionID)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
-}
-
-// broadcastStepToReady sends step command only to ready engines
-func (c *Controller) broadcastStepToReady(nodes map[int]*controller.NodeInfo) {
-	for _, node := range nodes {
-		go func(n *controller.NodeInfo) {
-			// Check if node is ready before stepping
-			if !c.isEngineReady(n) {
-				return // Skip unready nodes
-			}
-			
-			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Post(n.Endpoint+"/step", "application/json", nil)
-			if err != nil {
-				log.Printf("Failed to force step node %s: %v", n.PodID, err)
-				return
-			}
-			defer resp.Body.Close()
-			
-			if resp.StatusCode != 200 {
-				log.Printf("Force step failed for node %s: %d", n.PodID, resp.StatusCode)
-			}
-		}(node)
-	}
-}
-
-// promptReregistration tells an engine to re-register
-func (c *Controller) promptReregistration(node *controller.NodeInfo) {
-	go func() {
-		client := &http.Client{Timeout: 2 * time.Second}
-		resp, err := client.Post(node.Endpoint+"/force-reregister", "application/json", nil)
-		if err != nil {
-			atomic.AddInt64(&c.reregistFailures, 1)
-			log.Printf("Failed to prompt re-registration for %s: %v", node.PodID, err)
-			return
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != 200 {
-			atomic.AddInt64(&c.reregistFailures, 1)
-			log.Printf("Force re-registration failed for %s: %d", node.PodID, resp.StatusCode)
-		} else {
-			atomic.AddInt64(&c.reregistSuccesses, 1)
-			log.Printf("Successfully prompted re-registration for %s", node.PodID)
-		}
-	}()
-}
-
-// updateLastStepTime updates the timestamp of the last successful step
-func (c *Controller) updateLastStepTime() {
-	c.timingMu.Lock()
-	c.lastStepTime = time.Now()
-	c.timingMu.Unlock()
-}
-
-// handleMetrics returns detailed system metrics for monitoring
-func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	nodes := c.topology.GetAllNodes()
-	
-	// Count ready nodes
-	readyCount := 0
-	for _, node := range nodes {
-		if c.isEngineReady(node) {
-			readyCount++
-		}
-	}
-	
-	c.timingMu.RLock()
-	lastStep := c.lastStepTime
-	c.timingMu.RUnlock()
-	
-	metrics := map[string]interface{}{
-		"timestamp": time.Now().Unix(),
-		"nodes": map[string]interface{}{
-			"total":      len(nodes),
-			"ready":      readyCount,
-			"unready":    len(nodes) - readyCount,
-			"readyPct":   float64(readyCount) / float64(len(nodes)) * 100,
-		},
-		"requests": map[string]interface{}{
-			"total":         atomic.LoadInt64(&c.requestCounter),
-			"registrations": atomic.LoadInt64(&c.registrations),
-			"health":        atomic.LoadInt64(&c.healthChecks),
-			"neighbors":     atomic.LoadInt64(&c.neighborLookups),
-		},
-		"safeguards": map[string]interface{}{
-			"forceSteps":        atomic.LoadInt64(&c.forceStepCount),
-			"reregistPrompts":   atomic.LoadInt64(&c.reregistPrompts),
-			"reregistSuccesses": atomic.LoadInt64(&c.reregistSuccesses),
-			"reregistFailures":  atomic.LoadInt64(&c.reregistFailures),
-		},
-		"timing": map[string]interface{}{
-			"lastStepAge":    time.Since(lastStep).Milliseconds(),
-			"regionId":       c.regionID,
-		},
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
 }
