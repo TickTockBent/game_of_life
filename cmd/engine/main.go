@@ -55,9 +55,19 @@ type CellUpdateRequest struct {
 }
 
 func NewEngine() *Engine {
-	nodeID := os.Getenv("NODE_NAME")
-	if nodeID == "" {
-		nodeID = "standalone"
+	// Use last 5 characters of POD_NAME for unique identification
+	podName := os.Getenv("POD_NAME")
+	var nodeID string
+	if podName != "" && len(podName) >= 5 {
+		nodeID = podName[len(podName)-5:]
+	} else if podName != "" {
+		nodeID = podName
+	} else {
+		// Fallback to NODE_NAME for backwards compatibility
+		nodeID = os.Getenv("NODE_NAME")
+		if nodeID == "" {
+			nodeID = "standalone"
+		}
 	}
 	
 	// Always use external controller URL for global connectivity
@@ -98,6 +108,7 @@ func NewEngine() *Engine {
 	// Start periodic health checking if configured for distributed mode
 	if controllerURL != "" && selfEndpoint != "" {
 		go engine.healthCheckLoop()
+		go engine.positionVerificationLoop()
 	}
 	
 	return engine
@@ -610,6 +621,97 @@ func (e *Engine) handleForceReregister(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// positionVerificationLoop periodically checks position consistency with controller
+func (e *Engine) positionVerificationLoop() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			e.verifyPositionConsistency()
+		case <-e.healthStopChan:
+			log.Printf("Position verification loop stopped")
+			return
+		}
+	}
+}
+
+// verifyPositionConsistency checks if our position matches controller's view
+func (e *Engine) verifyPositionConsistency() {
+	if e.controllerURL == "" {
+		return
+	}
+	
+	// If we think we're registered but have no position, force re-registration
+	if e.registered && e.position < 0 {
+		log.Printf("Registered but no position - forcing re-registration")
+		e.forceReregister()
+		return
+	}
+	
+	// If not registered, skip verification
+	if !e.registered {
+		return
+	}
+	
+	// Get what controller thinks about our position
+	resp, err := e.httpClient.Get(fmt.Sprintf("%s/node/%d", e.controllerURL, e.position))
+	if err != nil {
+		log.Printf("Failed to verify position with controller: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		log.Printf("Controller doesn't recognize our position %d, forcing re-registration", e.position)
+		e.forceReregister()
+		return
+	}
+	
+	// Parse controller's response to check endpoint consistency
+	var nodeInfo struct {
+		PodID    string `json:"podId"`
+		Endpoint string `json:"endpoint"`
+		Position struct {
+			Row int `json:"row"`
+			Col int `json:"col"`
+		} `json:"position"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&nodeInfo); err != nil {
+		log.Printf("Failed to decode controller position response: %v", err)
+		return
+	}
+	
+	// Verify node ID matches
+	if nodeInfo.PodID != e.nodeID {
+		log.Printf("Position %d belongs to %s, not %s - forcing re-registration", e.position, nodeInfo.PodID, e.nodeID)
+		e.forceReregister()
+		return
+	}
+	
+	// Verify endpoint matches
+	if nodeInfo.Endpoint != e.selfEndpoint {
+		log.Printf("Controller has wrong endpoint for us (%s vs %s) - forcing re-registration", nodeInfo.Endpoint, e.selfEndpoint)
+		e.forceReregister()
+		return
+	}
+	
+	// Everything looks consistent - refresh neighbors to be safe
+	e.discoverNeighbors()
+}
+
+// forceReregister triggers a clean re-registration
+func (e *Engine) forceReregister() {
+	log.Printf("Forcing clean re-registration due to position inconsistency")
+	e.stopExistingLoops()
+	e.registered = false
+	e.isReady = false
+	e.position = -1
+	e.attemptRegistration()
 }
 
 // Old barrier sync methods removed - now using polling approach
