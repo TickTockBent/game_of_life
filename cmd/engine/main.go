@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,6 +27,11 @@ type Engine struct {
 	neighbors      map[string]string
 	crosstalkEnabled bool
 	lastEmptyCount int // Track boring threshold resets
+	isReady        bool // Ready status for barrier sync
+	httpClient     *http.Client // Shared HTTP client to prevent memory leaks
+	stopChan       chan struct{} // Channel to signal goroutines to stop
+	// Pre-allocated buffer for JSON edge data to avoid allocations
+	edgeBuffer     []bool
 }
 
 type GridStateResponse struct {
@@ -48,14 +54,29 @@ func NewEngine() *Engine {
 	}
 	
 	// Always use external controller URL for global connectivity
-	controllerURL := "http://gameoflife.ticktockbent.com"
+	controllerURL := "https://gameoflife-api.ticktockbent.com"
 	selfEndpoint := os.Getenv("SELF_ENDPOINT")
 	
+	// Create shared HTTP client with optimized settings for frequent polling
+	httpClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        5,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+
 	engine := &Engine{
 		grid:          gameoflife.NewGrid(),
 		nodeID:        nodeID,
 		controllerURL: controllerURL,
 		selfEndpoint:  selfEndpoint,
+		httpClient:    httpClient,
+		stopChan:      make(chan struct{}),
+		// Pre-allocate edge buffer for JSON unmarshaling
+		edgeBuffer:    make([]bool, gameoflife.GridSize),
 	}
 	
 	// Initialize distributed grid if controller URL is provided
@@ -76,8 +97,14 @@ func (e *Engine) healthCheckLoop() {
 	ticker := time.NewTicker(5 * time.Second) // Check every 5 seconds (less aggressive than controller)
 	defer ticker.Stop()
 	
-	for range ticker.C {
-		e.verifyRegistration()
+	for {
+		select {
+		case <-ticker.C:
+			e.verifyRegistration()
+		case <-e.stopChan:
+			log.Printf("Health check loop stopped")
+			return
+		}
 	}
 }
 
@@ -97,8 +124,7 @@ func (e *Engine) verifyRegistration() {
 
 // isControllerHealthy checks if controller responds to health check
 func (e *Engine) isControllerHealthy() bool {
-	client := &http.Client{Timeout: 1 * time.Second}
-	resp, err := client.Get(e.controllerURL + "/health")
+	resp, err := e.httpClient.Get(e.controllerURL + "/health")
 	if err != nil {
 		return false
 	}
@@ -112,8 +138,7 @@ func (e *Engine) isRegisteredWithController() bool {
 		return false
 	}
 	
-	client := &http.Client{Timeout: 1 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("%s/node/%d", e.controllerURL, e.position))
+	resp, err := e.httpClient.Get(fmt.Sprintf("%s/node/%d", e.controllerURL, e.position))
 	if err != nil {
 		return false
 	}
@@ -155,35 +180,46 @@ func (e *Engine) startBarrierSyncLoop() {
 	e.running = true
 	
 	go func() {
+		defer log.Printf("Barrier sync loop stopped")
+		
+		ticker := time.NewTicker(100 * time.Millisecond) // Reduced frequency to save memory
+		defer ticker.Stop()
+		
 		for e.running {
-			// 1. Poll neighbors for edge state (quick HTTP calls)
-			e.pollNeighborEdges()
-			
-			// 2. Compute next generation but don't commit yet
-			emptyBefore := e.grid.GetEmptyGenerations()
-			e.grid.ComputeNextGeneration() // New method - compute but don't commit
-			
-			// 3. Signal ready to controller
-			if e.signalReady() {
-				// 4. Wait for step command from controller
-				if e.waitForStep() {
-					// 5. Commit the computed generation
-					e.grid.CommitNextGeneration() // New method - commit the computed state
-					
-					// Check boring threshold
-					emptyAfter := e.grid.GetEmptyGenerations()
-					if emptyBefore >= 99 && emptyAfter == 0 {
-						log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+			select {
+			case <-ticker.C:
+				// 1. Poll neighbors for edge state (quick HTTP calls)
+				e.pollNeighborEdges()
+				
+				// 2. Compute next generation but don't commit yet
+				emptyBefore := e.grid.GetEmptyGenerations()
+				e.grid.ComputeNextGeneration()
+				
+				// 3. Mark ready and wait for controller to send step command
+				e.isReady = true
+				
+				// Wait for step command (controller will call our /step endpoint)
+				for e.isReady && e.running {
+					select {
+					case <-time.After(50 * time.Millisecond):
+						// Continue polling
+					case <-e.stopChan:
+						return
 					}
 				}
+				
+				// Check boring threshold after step
+				emptyAfter := e.grid.GetEmptyGenerations()
+				if emptyBefore >= 99 && emptyAfter == 0 {
+					log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
+				}
+			case <-e.stopChan:
+				return
 			}
-			
-			// Small delay to prevent tight loops on errors
-			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 	
-	log.Printf("Started barrier-synchronized simulation loop")
+	log.Printf("Started polling-based barrier sync loop")
 }
 
 // pollNeighborEdges fetches current edge state from all neighbors
@@ -193,9 +229,6 @@ func (e *Engine) pollNeighborEdges() {
 	}
 	
 	for direction, endpoint := range e.neighbors {
-		// Get current edge state from neighbor
-		client := &http.Client{Timeout: 100 * time.Millisecond}
-		
 		// Determine which edge to request based on our position relative to neighbor
 		var requestDirection string
 		switch direction {
@@ -211,19 +244,22 @@ func (e *Engine) pollNeighborEdges() {
 			continue
 		}
 		
-		resp, err := client.Get(endpoint + "/edges/" + requestDirection)
+		resp, err := e.httpClient.Get(endpoint + "/edges/" + requestDirection)
 		if err != nil {
 			// Neighbor not available, use empty edge data
 			continue
 		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode == 200 {
-			var edgeData []bool
-			if err := json.NewDecoder(resp.Body).Decode(&edgeData); err == nil {
-				e.grid.UpdateHaloRegion(direction, edgeData)
+		// Close immediately instead of defer to avoid accumulation
+		func() {
+			defer resp.Body.Close()
+			
+			if resp.StatusCode == 200 {
+				// Reuse pre-allocated buffer instead of creating new slice
+				if err := json.NewDecoder(resp.Body).Decode(&e.edgeBuffer); err == nil {
+					e.grid.UpdateHaloRegion(direction, e.edgeBuffer)
+				}
 			}
-		}
+		}()
 	}
 }
 
@@ -288,23 +324,23 @@ func (e *Engine) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	e.Stop()
+	w.WriteHeader(http.StatusOK)
+}
+
+// Stop gracefully shuts down the engine and cleans up goroutines
+func (e *Engine) Stop() {
 	e.running = false
 	if e.ticker != nil {
 		e.ticker.Stop()
 	}
 	
-	w.WriteHeader(http.StatusOK)
+	// Signal all goroutines to stop
+	close(e.stopChan)
+	log.Printf("Engine stopped and cleanup completed")
 }
 
-func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
-	if e.running {
-		http.Error(w, "Cannot step while running", http.StatusBadRequest)
-		return
-	}
-	
-	e.grid.NextGeneration()
-	w.WriteHeader(http.StatusOK)
-}
+// Old handleStep method removed - using new barrier sync version
 
 func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Randomizing grid with 30%% probability")
@@ -337,6 +373,34 @@ func (e *Engine) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+// handleReady returns the current ready status for barrier sync
+func (e *Engine) handleReady(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ready": e.isReady && e.registered,
+		"nodeId": e.nodeID,
+		"position": e.position,
+	})
+}
+
+// handleStep receives step command from controller
+func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
+	if !e.registered || !e.isReady {
+		http.Error(w, "Not ready for step", http.StatusBadRequest)
+		return
+	}
+	
+	// Commit the computed generation and mark not ready
+	e.grid.CommitNextGeneration()
+	e.isReady = false
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"stepped": true,
+		"generation": e.grid.Generation,
+	})
+}
+
 func (e *Engine) handleGetEdge(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	direction := vars["direction"]
@@ -359,8 +423,7 @@ func (e *Engine) discoverNeighbors() {
 		return
 	}
 	
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("%s/neighbors/%d", e.controllerURL, e.position))
+	resp, err := e.httpClient.Get(fmt.Sprintf("%s/neighbors/%d", e.controllerURL, e.position))
 	if err != nil {
 		log.Printf("Failed to discover neighbors: %v", err)
 		return
@@ -420,9 +483,10 @@ func main() {
 	r.HandleFunc("/cell", engine.handleUpdateCell).Methods("POST")
 	r.HandleFunc("/start", engine.handleStart).Methods("POST")
 	r.HandleFunc("/stop", engine.handleStop).Methods("POST")
-	r.HandleFunc("/step", engine.handleStep).Methods("POST")
 	r.HandleFunc("/randomize", engine.handleRandomize).Methods("POST")
 	r.HandleFunc("/health", engine.handleHealth).Methods("GET")
+	r.HandleFunc("/ready", engine.handleReady).Methods("GET")
+	r.HandleFunc("/step", engine.handleStep).Methods("POST")
 	r.HandleFunc("/edges/{direction}", engine.handleGetEdge).Methods("GET")
 	r.HandleFunc("/neighbors/refresh", engine.handleRefreshNeighbors).Methods("POST")
 	
@@ -465,52 +529,17 @@ func (e *Engine) neighborDiscoveryLoop() {
 	ticker := time.NewTicker(10 * time.Second) // Refresh neighbors every 10 seconds
 	defer ticker.Stop()
 	
-	for range ticker.C {
-		if e.registered {
-			e.discoverNeighbors()
-		}
-	}
-}
-
-// signalReady signals to controller that this node is ready for next step
-func (e *Engine) signalReady() bool {
-	if !e.registered {
-		return false
-	}
-	
-	client := &http.Client{Timeout: 1 * time.Second}
-	resp, err := client.Post(
-		fmt.Sprintf("%s/ready/%d", e.controllerURL, e.position),
-		"application/json",
-		nil,
-	)
-	if err != nil {
-		log.Printf("Failed to signal ready: %v", err)
-		return false
-	}
-	defer resp.Body.Close()
-	
-	return resp.StatusCode == 200
-}
-
-// waitForStep waits for controller to broadcast step command
-func (e *Engine) waitForStep() bool {
-	client := &http.Client{Timeout: 15 * time.Second} // Longer timeout for coordination
-	resp, err := client.Get(e.controllerURL + "/wait-step")
-	if err != nil {
-		log.Printf("Failed to wait for step: %v", err)
-		return false
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode == 200 {
-		var stepCmd map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&stepCmd); err == nil {
-			if stepCmd["command"] == "step" {
-				return true
+	for {
+		select {
+		case <-ticker.C:
+			if e.registered {
+				e.discoverNeighbors()
 			}
+		case <-e.stopChan:
+			log.Printf("Neighbor discovery loop stopped")
+			return
 		}
 	}
-	
-	return false
 }
+
+// Old barrier sync methods removed - now using polling approach

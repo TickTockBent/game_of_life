@@ -16,7 +16,6 @@ import (
 type Controller struct {
 	topology *controller.Topology
 	regionID string
-	stepChannel chan bool // Channel to broadcast step commands
 }
 
 type RegisterRequest struct {
@@ -43,7 +42,6 @@ func NewController() *Controller {
 	c := &Controller{
 		topology: controller.NewTopology(),
 		regionID: regionID,
-		stepChannel: make(chan bool, 100), // Buffered for multiple subscribers
 	}
 	
 	// Start aggressive health checking
@@ -90,29 +88,79 @@ func (c *Controller) isNodeHealthy(node *controller.NodeInfo) bool {
 	return resp.StatusCode == 200
 }
 
-// barrierSyncLoop coordinates barrier synchronization across all nodes
+// barrierSyncLoop coordinates barrier synchronization by polling engines
 func (c *Controller) barrierSyncLoop() {
-	ticker := time.NewTicker(100 * time.Millisecond) // Check readiness frequently
+	ticker := time.NewTicker(50 * time.Millisecond) // Poll frequently for responsiveness
 	defer ticker.Stop()
 	
 	for range ticker.C {
-		if c.topology.AreAllNodesReady() {
-			// All nodes ready - broadcast step command
-			readyCount, totalCount := c.topology.GetReadyCount()
-			if totalCount > 0 {
-				log.Printf("All %d nodes ready - broadcasting step", totalCount)
-				
-				// Reset ready status for next cycle
-				c.topology.ResetReadyStatus()
-				
-				// Broadcast step to all waiting nodes
-				select {
-				case c.stepChannel <- true:
-				default:
-					// Channel full, skip this step
-				}
-			}
+		nodes := c.topology.GetAllNodes()
+		if len(nodes) == 0 {
+			continue
 		}
+		
+		// Poll all engines to check if they're ready
+		readyCount := c.checkAllEnginesReady(nodes)
+		
+		if readyCount == len(nodes) {
+			log.Printf("All %d nodes ready - broadcasting step", len(nodes))
+			c.broadcastStep(nodes)
+		}
+	}
+}
+
+// checkAllEnginesReady polls all engines' /ready endpoints
+func (c *Controller) checkAllEnginesReady(nodes map[int]*controller.NodeInfo) int {
+	readyCount := 0
+	
+	for _, node := range nodes {
+		if c.isEngineReady(node) {
+			readyCount++
+		}
+	}
+	
+	return readyCount
+}
+
+// isEngineReady checks if a specific engine is ready
+func (c *Controller) isEngineReady(node *controller.NodeInfo) bool {
+	client := &http.Client{Timeout: 1 * time.Second}
+	
+	resp, err := client.Get(node.Endpoint + "/ready")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return false
+	}
+	
+	var readyResp map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&readyResp); err != nil {
+		return false
+	}
+	
+	ready, ok := readyResp["ready"].(bool)
+	return ok && ready
+}
+
+// broadcastStep sends step command to all engines
+func (c *Controller) broadcastStep(nodes map[int]*controller.NodeInfo) {
+	for _, node := range nodes {
+		go func(n *controller.NodeInfo) {
+			client := &http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Post(n.Endpoint+"/step", "application/json", nil)
+			if err != nil {
+				log.Printf("Failed to step node %s: %v", n.PodID, err)
+				return
+			}
+			defer resp.Body.Close()
+			
+			if resp.StatusCode != 200 {
+				log.Printf("Step failed for node %s: %d", n.PodID, resp.StatusCode)
+			}
+		}(node)
 	}
 }
 
@@ -207,38 +255,7 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
-// handleReady allows nodes to signal they are ready for the next step
-func (c *Controller) handleReady(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-	
-	c.topology.MarkNodeReady(position)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ready",
-		"position": position,
-	})
-}
-
-// handleWaitForStep blocks until all nodes are ready and step is broadcast
-func (c *Controller) handleWaitForStep(w http.ResponseWriter, r *http.Request) {
-	// Wait for step signal with timeout
-	select {
-	case <-c.stepChannel:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"command": "step",
-			"timestamp": time.Now().Unix(),
-		})
-	case <-time.After(10 * time.Second): // Timeout after 10 seconds
-		http.Error(w, "Timeout waiting for step", http.StatusRequestTimeout)
-	}
-}
+// Old barrier sync handlers removed - now using polling approach
 
 func main() {
 	controller := NewController()
@@ -257,9 +274,7 @@ func main() {
 	// Health check
 	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
 	
-	// Barrier synchronization endpoints
-	r.HandleFunc("/ready/{position}", controller.handleReady).Methods("POST")
-	r.HandleFunc("/wait-step", controller.handleWaitForStep).Methods("GET")
+	// Removed old barrier sync endpoints - now using polling
 	
 	port := os.Getenv("PORT")
 	if port == "" {

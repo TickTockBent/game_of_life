@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-  - host: gameoflife.ticktockbent.com
+  - host: gameoflife-api.ticktockbent.com
     http:
       paths:
       - path: /register

@@ -2,6 +2,7 @@ package grid
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -44,6 +45,9 @@ func NewDistributedGrid(controllerURL, selfEndpoint string) *DistributedGrid {
 		neighborEdges: make(map[Direction][]bool),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
 		},
 	}
 }

@@ -17,6 +17,10 @@ type Grid struct {
 	haloSouth []bool
 	haloEast  []bool
 	haloWest  []bool
+	// Pre-allocated edge data structures to avoid allocations
+	edgeData map[string][]bool
+	// Pre-allocated state array for GetState() to avoid allocations
+	stateArray [][GridSize]bool
 	// Neighbor endpoints for communication
 	neighbors map[string]string
 	crosstalkEnabled bool
@@ -26,10 +30,25 @@ type Grid struct {
 }
 
 func NewGrid() *Grid {
+	// Pre-allocate all edge data structures once to avoid allocations in hot paths
+	edgeData := make(map[string][]bool)
+	edgeData["north"] = make([]bool, GridSize)
+	edgeData["south"] = make([]bool, GridSize)
+	edgeData["east"] = make([]bool, GridSize)
+	edgeData["west"] = make([]bool, GridSize)
+	
 	return &Grid{
 		neighbors: make(map[string]string),
 		crosstalkEnabled: false,
 		boringThreshold: 100, // Auto-randomize after 100 empty generations
+		edgeData: edgeData,
+		// Pre-allocate halo regions too
+		haloNorth: make([]bool, GridSize),
+		haloSouth: make([]bool, GridSize),
+		haloEast:  make([]bool, GridSize),
+		haloWest:  make([]bool, GridSize),
+		// Pre-allocate state array 
+		stateArray: make([][GridSize]bool, GridSize),
 	}
 }
 
@@ -111,10 +130,10 @@ func (g *Grid) ComputeNextGeneration() {
 			neighbors := g.countNeighbors(x, y)
 			
 			// Apply Conway's Game of Life rules
-			if g.Cells[x][y].Alive {
-				g.NextGen[x][y].Alive = neighbors == 2 || neighbors == 3
+			if g.Cells[x][y] {
+				g.NextGen[x][y] = neighbors == 2 || neighbors == 3
 			} else {
-				g.NextGen[x][y].Alive = neighbors == 3
+				g.NextGen[x][y] = neighbors == 3
 			}
 		}
 	}
@@ -192,13 +211,13 @@ func (g *Grid) isEmpty() bool {
 }
 
 func (g *Grid) GetState() ([][GridSize]bool, int) {
-	state := make([][GridSize]bool, GridSize)
+	// Reuse pre-allocated state array instead of creating new one
 	for i := 0; i < GridSize; i++ {
 		for j := 0; j < GridSize; j++ {
-			state[i][j] = bool(g.Cells[i][j])
+			g.stateArray[i][j] = bool(g.Cells[i][j])
 		}
 	}
-	return state, g.Generation
+	return g.stateArray, g.Generation
 }
 
 func (g *Grid) GetGeneration() int {
@@ -211,13 +230,13 @@ func (g *Grid) GetEmptyGenerations() int {
 }
 
 func (g *Grid) GetEdgeCells() map[string][]bool {
-	edges := make(map[string][]bool)
+	// Reuse pre-allocated slices instead of creating new ones
+	north := g.edgeData["north"]
+	south := g.edgeData["south"]
+	east := g.edgeData["east"]
+	west := g.edgeData["west"]
 	
-	north := make([]bool, GridSize)
-	south := make([]bool, GridSize)
-	east := make([]bool, GridSize)
-	west := make([]bool, GridSize)
-	
+	// Just overwrite the existing slice contents
 	for i := 0; i < GridSize; i++ {
 		north[i] = bool(g.Cells[0][i])
 		south[i] = bool(g.Cells[GridSize-1][i])
@@ -225,12 +244,8 @@ func (g *Grid) GetEdgeCells() map[string][]bool {
 		east[i] = bool(g.Cells[i][GridSize-1])
 	}
 	
-	edges["north"] = north
-	edges["south"] = south
-	edges["east"] = east
-	edges["west"] = west
-	
-	return edges
+	// Return the same map each time (no new allocation)
+	return g.edgeData
 }
 
 // SetNeighbors configures the neighbor endpoints for crosstalk
