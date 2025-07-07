@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -16,6 +18,13 @@ import (
 type Controller struct {
 	topology *controller.Topology
 	regionID string
+	// Request tracking for overload detection
+	requestCounter  int64
+	registrations   int64
+	neighborLookups int64
+	healthChecks    int64
+	mu              sync.Mutex
+	lastStatsLog    time.Time
 }
 
 type RegisterRequest struct {
@@ -42,7 +51,11 @@ func NewController() *Controller {
 	c := &Controller{
 		topology: controller.NewTopology(),
 		regionID: regionID,
+		lastStatsLog: time.Now(),
 	}
+	
+	// Start request statistics logging
+	go c.statsLoop()
 	
 	// Start aggressive health checking
 	go c.healthCheckLoop()
@@ -164,6 +177,80 @@ func (c *Controller) broadcastStep(nodes map[int]*controller.NodeInfo) {
 	}
 }
 
+// requestLoggingMiddleware logs request patterns and detects overload
+func (c *Controller) requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		atomic.AddInt64(&c.requestCounter, 1)
+		
+		// Track specific endpoint types
+		switch {
+		case r.URL.Path == "/register":
+			atomic.AddInt64(&c.registrations, 1)
+		case r.URL.Path == "/health":
+			atomic.AddInt64(&c.healthChecks, 1)
+		case len(r.URL.Path) > 10 && r.URL.Path[:10] == "/neighbors":
+			atomic.AddInt64(&c.neighborLookups, 1)
+		}
+		
+		next.ServeHTTP(w, r)
+		
+		duration := time.Since(start)
+		if duration > 500*time.Millisecond {
+			log.Printf("SLOW REQUEST: %s %s took %v", r.Method, r.URL.Path, duration)
+		}
+	})
+}
+
+// statsLoop logs request statistics every 30 seconds
+func (c *Controller) statsLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		c.logRequestStats()
+	}
+}
+
+// logRequestStats prints current request load and detects overload patterns
+func (c *Controller) logRequestStats() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	now := time.Now()
+	duration := now.Sub(c.lastStatsLog)
+	c.lastStatsLog = now
+	
+	totalReqs := atomic.LoadInt64(&c.requestCounter)
+	regs := atomic.LoadInt64(&c.registrations)
+	health := atomic.LoadInt64(&c.healthChecks)
+	neighbors := atomic.LoadInt64(&c.neighborLookups)
+	
+	// Calculate rates per minute
+	minutes := duration.Minutes()
+	totalRate := float64(totalReqs) / minutes
+	regRate := float64(regs) / minutes
+	healthRate := float64(health) / minutes
+	neighborRate := float64(neighbors) / minutes
+	
+	log.Printf("REQUEST STATS: %.1f req/min (%.1f reg/min, %.1f health/min, %.1f neighbor/min) - %d nodes", 
+		totalRate, regRate, healthRate, neighborRate, len(c.topology.GetAllNodes()))
+	
+	// Detect potential overload patterns
+	if totalRate > 300 {
+		log.Printf("WARNING: High request rate detected (%.1f req/min)", totalRate)
+	}
+	if regRate > 20 {
+		log.Printf("WARNING: High registration churn detected (%.1f reg/min)", regRate)
+	}
+	
+	// Reset counters
+	atomic.StoreInt64(&c.requestCounter, 0)
+	atomic.StoreInt64(&c.registrations, 0)
+	atomic.StoreInt64(&c.healthChecks, 0)
+	atomic.StoreInt64(&c.neighborLookups, 0)
+}
+
 func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -261,6 +348,9 @@ func main() {
 	controller := NewController()
 	
 	r := mux.NewRouter()
+	
+	// Add request logging middleware
+	r.Use(controller.requestLoggingMiddleware)
 	
 	// Registration endpoints
 	r.HandleFunc("/register", controller.handleRegister).Methods("POST")

@@ -167,8 +167,7 @@ func (e *Engine) attemptRegistration() {
 	if err := e.distributedGrid.Register(e.nodeID); err != nil {
 		log.Printf("Failed to re-register with controller: %v", err)
 		e.registered = false
-		// Health endpoint will now return unhealthy status, triggering k8s restart
-		log.Printf("Marking as unregistered - health checks will fail to trigger pod restart")
+		// Will continue trying to re-register on next health check cycle
 	} else {
 		e.position = e.distributedGrid.GetPosition()
 		e.registered = true
@@ -369,18 +368,10 @@ func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleHealth(w http.ResponseWriter, r *http.Request) {
-	// Simple registration-based health check - no locks required
-	status := "healthy"
-	if e.controllerURL != "" {
-		// In distributed mode, health depends on registration status
-		if !e.registered {
-			status = "unhealthy"
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-	}
-	
+	// Simple health check - if pod can respond, it's healthy
+	// Registration status is informational only, not a health indicator
 	health := map[string]interface{}{
-		"status": status,
+		"status": "healthy",
 		"nodeId": e.nodeID,
 		"registered": e.registered,
 	}
@@ -520,8 +511,7 @@ func main() {
 		if err := engine.distributedGrid.Register(engine.nodeID); err != nil {
 			log.Printf("Failed to register with controller: %v", err)
 			engine.registered = false
-			// Health endpoint will return unhealthy status, triggering k8s restart
-			log.Printf("Initial registration failed - health checks will fail to trigger pod restart")
+			// Will continue trying to register via health check loop
 		} else {
 			engine.position = engine.distributedGrid.GetPosition()
 			engine.registered = true
