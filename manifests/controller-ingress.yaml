@@ -70,3 +70,24 @@ spec:
             name: gameoflife-controller
             port:
               number: 8081
+      - path: /metrics
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /aggregated-state
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /state
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081

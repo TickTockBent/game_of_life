@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -427,11 +428,54 @@ func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
 	e.grid.CommitNextGeneration()
 	e.isReady = false
 	
+	// Push state update to controller
+	go e.pushStateToController()
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"stepped": true,
 		"generation": e.grid.Generation,
 	})
+}
+
+// pushStateToController sends current grid state to controller
+func (e *Engine) pushStateToController() {
+	if !e.registered {
+		return
+	}
+
+	// Convert grid to [][]bool format for JSON
+	gridState := make([][]bool, gameoflife.GridSize)
+	for i := range gridState {
+		gridState[i] = make([]bool, gameoflife.GridSize)
+		for j := range gridState[i] {
+			gridState[i][j] = bool(e.grid.Cells[i][j])
+		}
+	}
+
+	stateUpdate := map[string]interface{}{
+		"grid":       gridState,
+		"generation": e.grid.Generation,
+	}
+
+	jsonData, err := json.Marshal(stateUpdate)
+	if err != nil {
+		log.Printf("Failed to marshal state update: %v", err)
+		return
+	}
+
+	url := fmt.Sprintf("%s/state/%d", e.controllerURL, e.position)
+	resp, err := e.httpClient.Post(url, "application/json", 
+		strings.NewReader(string(jsonData)))
+	if err != nil {
+		log.Printf("Failed to push state to controller: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("Controller rejected state update: %d", resp.StatusCode)
+	}
 }
 
 func (e *Engine) handleGetEdge(w http.ResponseWriter, r *http.Request) {

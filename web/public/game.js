@@ -7,19 +7,23 @@ class GameOfLifeVisualizer {
         this.topology = null;
         this.lastUpdateTime = Date.now();
         this.isUpdating = false; // Prevent concurrent updates
+        this.currentInterval = 300; // Track current refresh interval
         
         this.setupEventListeners();
         this.refreshData();
         
-        // Auto-refresh every 100ms for very smooth Game of Life visualization
-        setInterval(() => {
-            this.refreshData();
-        }, 100);
+        // Auto-refresh with adaptive rate based on node count
+        this.startAdaptiveRefresh();
         
         // Update timing display every second
         setInterval(() => {
             this.updateTimingDisplay();
         }, 1000);
+        
+        // Update metrics every 2 seconds
+        setInterval(() => {
+            this.updateMetrics();
+        }, 2000);
     }
     
     setupEventListeners() {
@@ -32,22 +36,46 @@ class GameOfLifeVisualizer {
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
     }
     
+    startAdaptiveRefresh() {
+        const refreshData = () => {
+            if (!this.isUpdating) {
+                this.refreshData();
+            }
+        };
+        
+        // Fast refresh rate now that we only call controller once
+        this.refreshInterval = setInterval(refreshData, 100); // Back to 100ms
+    }
+    
     async refreshData() {
+        if (this.isUpdating) return; // Prevent overlapping requests
+        
+        this.isUpdating = true;
         try {
             const response = await fetch('/api/grid');
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
             const data = await response.json();
             
-            this.gridData = data.grids;
-            this.topology = data.topology;
-            this.lastUpdateTime = Date.now();
-            
-            this.updateStatus();
-            this.updateNodeInfo();
-            this.draw();
+            // Only update if we got valid data
+            if (data.grids && data.topology) {
+                this.gridData = data.grids;
+                this.topology = data.topology;
+                this.lastUpdateTime = Date.now();
+                
+                this.updateStatus();
+                this.updateNodeInfo();
+                this.draw();
+            }
         } catch (error) {
             console.error('Failed to refresh data:', error);
+        } finally {
+            this.isUpdating = false;
         }
     }
+    
     
     updateTimingDisplay() {
         const secondsAgo = Math.floor((Date.now() - this.lastUpdateTime) / 1000);
@@ -259,6 +287,58 @@ class GameOfLifeVisualizer {
         });
         
         await Promise.all(promises);
+    }
+    
+    async updateMetrics() {
+        try {
+            const response = await fetch('/api/metrics');
+            const data = await response.json();
+            
+            if (data.controller) {
+                const metrics = data.controller;
+                
+                // Node readiness
+                if (metrics.nodes) {
+                    const readyPct = Math.round(metrics.nodes.readyPct || 0);
+                    document.getElementById('nodeReady').textContent = 
+                        `${metrics.nodes.ready || 0}/${metrics.nodes.total || 0} (${readyPct}%)`;
+                }
+                
+                // Controller load (total requests)
+                if (metrics.requests) {
+                    const total = metrics.requests.total || 0;
+                    const health = metrics.requests.health || 0;
+                    const regs = metrics.requests.registrations || 0;
+                    document.getElementById('controllerLoad').textContent = 
+                        `${total} (${health}h ${regs}r)`;
+                }
+                
+                // Force steps
+                if (metrics.safeguards) {
+                    document.getElementById('forceSteps').textContent = 
+                        metrics.safeguards.forceSteps || 0;
+                    
+                    // Re-registrations (prompts/successes/failures)
+                    const prompts = metrics.safeguards.reregistPrompts || 0;
+                    const successes = metrics.safeguards.reregistSuccesses || 0;
+                    const failures = metrics.safeguards.reregistFailures || 0;
+                    document.getElementById('reregistrations').textContent = 
+                        `${prompts}p ${successes}s ${failures}f`;
+                }
+                
+                // Last step timing
+                if (metrics.timing) {
+                    const lastStepAge = metrics.timing.lastStepAge || 0;
+                    if (lastStepAge < 1000) {
+                        document.getElementById('lastStep').textContent = `${lastStepAge}ms ago`;
+                    } else {
+                        document.getElementById('lastStep').textContent = `${Math.round(lastStepAge/1000)}s ago`;
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Failed to fetch metrics:', error);
+        }
     }
     
     // Removed updateControlButtons - no longer needed without play/pause controls
