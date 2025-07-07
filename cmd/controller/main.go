@@ -25,6 +25,10 @@ type Controller struct {
 	healthChecks    int64
 	mu              sync.Mutex
 	lastStatsLog    time.Time
+	// Timing safeguards
+	lastStepTime    time.Time
+	nodeReadyTimes  map[int]time.Time
+	timingMu        sync.RWMutex
 }
 
 type RegisterRequest struct {
@@ -52,6 +56,8 @@ func NewController() *Controller {
 		topology: controller.NewTopology(),
 		regionID: regionID,
 		lastStatsLog: time.Now(),
+		lastStepTime: time.Now(),
+		nodeReadyTimes: make(map[int]time.Time),
 	}
 	
 	// Start request statistics logging
@@ -118,17 +124,43 @@ func (c *Controller) barrierSyncLoop() {
 		if readyCount == len(nodes) {
 			log.Printf("All %d nodes ready - broadcasting step", len(nodes))
 			c.broadcastStep(nodes)
+			c.updateLastStepTime()
+		} else {
+			// Check if we should force step due to timeout
+			c.timingMu.RLock()
+			lastStep := c.lastStepTime
+			c.timingMu.RUnlock()
+			
+			if time.Since(lastStep) > 1*time.Second {
+				log.Printf("Force stepping %d/%d ready nodes after 1s timeout", readyCount, len(nodes))
+				c.broadcastStepToReady(nodes)
+				c.updateLastStepTime()
+			}
 		}
 	}
 }
 
-// checkAllEnginesReady polls all engines' /ready endpoints
+// checkAllEnginesReady polls all engines' /ready endpoints and tracks timing
 func (c *Controller) checkAllEnginesReady(nodes map[int]*controller.NodeInfo) int {
 	readyCount := 0
+	now := time.Now()
 	
-	for _, node := range nodes {
+	c.timingMu.Lock()
+	defer c.timingMu.Unlock()
+	
+	for position, node := range nodes {
 		if c.isEngineReady(node) {
 			readyCount++
+			c.nodeReadyTimes[position] = now // Update ready time
+		} else {
+			// Check if node has been unready too long
+			if lastReady, exists := c.nodeReadyTimes[position]; exists {
+				if now.Sub(lastReady) > 1*time.Second {
+					log.Printf("Node %s unready for >1s, prompting re-registration", node.PodID)
+					c.promptReregistration(node)
+					delete(c.nodeReadyTimes, position) // Reset timer
+				}
+			}
 		}
 	}
 	
@@ -373,4 +405,54 @@ func main() {
 	
 	log.Printf("Game of Life Controller starting on port %s (Region: %s)\n", port, controller.regionID)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
+}
+
+// broadcastStepToReady sends step command only to ready engines
+func (c *Controller) broadcastStepToReady(nodes map[int]*controller.NodeInfo) {
+	for _, node := range nodes {
+		go func(n *controller.NodeInfo) {
+			// Check if node is ready before stepping
+			if !c.isEngineReady(n) {
+				return // Skip unready nodes
+			}
+			
+			client := &http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Post(n.Endpoint+"/step", "application/json", nil)
+			if err != nil {
+				log.Printf("Failed to force step node %s: %v", n.PodID, err)
+				return
+			}
+			defer resp.Body.Close()
+			
+			if resp.StatusCode != 200 {
+				log.Printf("Force step failed for node %s: %d", n.PodID, resp.StatusCode)
+			}
+		}(node)
+	}
+}
+
+// promptReregistration tells an engine to re-register
+func (c *Controller) promptReregistration(node *controller.NodeInfo) {
+	go func() {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Post(node.Endpoint+"/force-reregister", "application/json", nil)
+		if err != nil {
+			log.Printf("Failed to prompt re-registration for %s: %v", node.PodID, err)
+			return
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode != 200 {
+			log.Printf("Force re-registration failed for %s: %d", node.PodID, resp.StatusCode)
+		} else {
+			log.Printf("Successfully prompted re-registration for %s", node.PodID)
+		}
+	}()
+}
+
+// updateLastStepTime updates the timestamp of the last successful step
+func (c *Controller) updateLastStepTime() {
+	c.timingMu.Lock()
+	c.lastStepTime = time.Now()
+	c.timingMu.Unlock()
 }

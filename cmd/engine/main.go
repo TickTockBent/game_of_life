@@ -396,8 +396,19 @@ func (e *Engine) handleReady(w http.ResponseWriter, r *http.Request) {
 
 // handleStep receives step command from controller
 func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
-	if !e.registered || !e.isReady {
-		http.Error(w, "Not ready for step", http.StatusBadRequest)
+	if !e.registered {
+		http.Error(w, "Not registered", http.StatusBadRequest)
+		return
+	}
+	
+	// Handle duplicate steps gracefully - if already unready, ignore
+	if !e.isReady {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stepped": false,
+			"message": "already stepped",
+			"generation": e.grid.Generation,
+		})
 		return
 	}
 	
@@ -500,6 +511,7 @@ func main() {
 	r.HandleFunc("/step", engine.handleStep).Methods("POST")
 	r.HandleFunc("/edges/{direction}", engine.handleGetEdge).Methods("GET")
 	r.HandleFunc("/neighbors/refresh", engine.handleRefreshNeighbors).Methods("POST")
+	r.HandleFunc("/force-reregister", engine.handleForceReregister).Methods("POST")
 	
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -572,6 +584,32 @@ func (e *Engine) stopExistingLoops() {
 		e.syncLoopRunning = false
 		e.running = false // Reset running state so new loop can start
 	}
+}
+
+// handleForceReregister forces the engine to re-register with controller
+func (e *Engine) handleForceReregister(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received force re-registration request from controller")
+	
+	// Stop existing loops and reset state
+	e.stopExistingLoops()
+	e.registered = false
+	e.isReady = false
+	
+	// Attempt re-registration immediately
+	e.attemptRegistration()
+	
+	// Return current status
+	response := map[string]interface{}{
+		"reregistered": e.registered,
+		"nodeId": e.nodeID,
+	}
+	
+	if e.registered {
+		response["position"] = e.position
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // Old barrier sync methods removed - now using polling approach
