@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -32,6 +33,12 @@ type Engine struct {
 	stopChan       chan struct{} // Channel to signal goroutines to stop
 	// Pre-allocated buffer for JSON edge data to avoid allocations
 	edgeBuffer     []bool
+	// Track if sync loop is running to prevent duplicates
+	syncLoopRunning bool
+	// Separate stop channels for each goroutine
+	healthStopChan    chan struct{}
+	syncStopChan      chan struct{}
+	neighborStopChan  chan struct{}
 }
 
 type GridStateResponse struct {
@@ -77,6 +84,10 @@ func NewEngine() *Engine {
 		stopChan:      make(chan struct{}),
 		// Pre-allocate edge buffer for JSON unmarshaling
 		edgeBuffer:    make([]bool, gameoflife.GridSize),
+		// Initialize separate stop channels
+		healthStopChan:   make(chan struct{}),
+		syncStopChan:     make(chan struct{}),
+		neighborStopChan: make(chan struct{}),
 	}
 	
 	// Initialize distributed grid if controller URL is provided
@@ -101,7 +112,7 @@ func (e *Engine) healthCheckLoop() {
 		select {
 		case <-ticker.C:
 			e.verifyRegistration()
-		case <-e.stopChan:
+		case <-e.healthStopChan:
 			log.Printf("Health check loop stopped")
 			return
 		}
@@ -163,6 +174,9 @@ func (e *Engine) attemptRegistration() {
 		e.registered = true
 		log.Printf("Successfully re-registered with controller at position %d", e.position)
 		
+		// Stop existing loops before starting new ones
+		e.stopExistingLoops()
+		
 		// Discover neighbors and enable crosstalk
 		e.discoverNeighbors()
 		
@@ -173,14 +187,20 @@ func (e *Engine) attemptRegistration() {
 
 // startBarrierSyncLoop starts barrier-synchronized Game of Life simulation
 func (e *Engine) startBarrierSyncLoop() {
-	if e.running {
-		return // Already running
+	// Prevent multiple sync loops
+	if e.syncLoopRunning {
+		log.Printf("Barrier sync loop already running, skipping start")
+		return
 	}
 	
 	e.running = true
+	e.syncLoopRunning = true
 	
 	go func() {
-		defer log.Printf("Barrier sync loop stopped")
+		defer func() {
+			log.Printf("Barrier sync loop stopped")
+			e.syncLoopRunning = false
+		}()
 		
 		ticker := time.NewTicker(100 * time.Millisecond) // Reduced frequency to save memory
 		defer ticker.Stop()
@@ -203,7 +223,7 @@ func (e *Engine) startBarrierSyncLoop() {
 					select {
 					case <-time.After(50 * time.Millisecond):
 						// Continue polling
-					case <-e.stopChan:
+					case <-e.syncStopChan:
 						return
 					}
 				}
@@ -213,7 +233,7 @@ func (e *Engine) startBarrierSyncLoop() {
 				if emptyBefore >= 99 && emptyAfter == 0 {
 					log.Printf("🎲 Boring threshold reached! Auto-randomized grid after %d empty generations", emptyBefore)
 				}
-			case <-e.stopChan:
+			case <-e.syncStopChan:
 				return
 			}
 		}
@@ -249,17 +269,17 @@ func (e *Engine) pollNeighborEdges() {
 			// Neighbor not available, use empty edge data
 			continue
 		}
-		// Close immediately instead of defer to avoid accumulation
-		func() {
-			defer resp.Body.Close()
-			
-			if resp.StatusCode == 200 {
-				// Reuse pre-allocated buffer instead of creating new slice
-				if err := json.NewDecoder(resp.Body).Decode(&e.edgeBuffer); err == nil {
-					e.grid.UpdateHaloRegion(direction, e.edgeBuffer)
-				}
+		
+		// Process response and close body immediately
+		if resp.StatusCode == 200 {
+			// Reuse pre-allocated buffer instead of creating new slice
+			if err := json.NewDecoder(resp.Body).Decode(&e.edgeBuffer); err == nil {
+				e.grid.UpdateHaloRegion(direction, e.edgeBuffer)
 			}
-		}()
+		}
+		// Drain and close body to ensure connection reuse
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close() // Close immediately, not deferred
 	}
 }
 
@@ -539,6 +559,28 @@ func (e *Engine) neighborDiscoveryLoop() {
 			log.Printf("Neighbor discovery loop stopped")
 			return
 		}
+	}
+}
+
+// stopExistingLoops stops all running goroutines before re-registration
+func (e *Engine) stopExistingLoops() {
+	// Stop sync loop if running
+	if e.syncLoopRunning {
+		log.Printf("Stopping existing barrier sync loop before re-registration")
+		if e.syncStopChan != nil {
+			select {
+			case <-e.syncStopChan:
+				// Already closed
+			default:
+				close(e.syncStopChan)
+			}
+		}
+		// Wait a bit for the loop to stop
+		time.Sleep(200 * time.Millisecond)
+		// Create a new channel for the next loop
+		e.syncStopChan = make(chan struct{})
+		e.syncLoopRunning = false
+		e.running = false // Reset running state so new loop can start
 	}
 }
 
