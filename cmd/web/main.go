@@ -25,8 +25,11 @@ type CellClickRequest struct {
 }
 
 func NewWebServer() *WebServer {
-	// Always use external controller URL for global connectivity
-	controllerURL := "https://gameoflife-api.ticktockbent.com"
+	// Use external controller URL for global connectivity
+	controllerURL := os.Getenv("CONTROLLER_URL")
+	if controllerURL == "" {
+		controllerURL = "https://gameoflife-api.ticktockbent.com"
+	}
 
 	// Create reusable HTTP client with connection pooling
 	httpClient := &http.Client{

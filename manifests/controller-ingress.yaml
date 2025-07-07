@@ -91,3 +91,17 @@ spec:
             name: gameoflife-controller
             port:
               number: 8081
+      - path: /halo
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+      - path: /generation
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
