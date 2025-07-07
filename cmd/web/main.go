@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +15,7 @@ import (
 
 type WebServer struct {
 	controllerURL string
+	httpClient    *http.Client
 }
 
 type CellClickRequest struct {
@@ -23,10 +26,22 @@ type CellClickRequest struct {
 
 func NewWebServer() *WebServer {
 	// Always use external controller URL for global connectivity
-	controllerURL := "http://gameoflife.ticktockbent.com"
+	controllerURL := "https://gameoflife-api.ticktockbent.com"
+
+	// Create reusable HTTP client with connection pooling
+	httpClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
 	return &WebServer{
 		controllerURL: controllerURL,
+		httpClient:    httpClient,
 	}
 }
 
@@ -37,7 +52,7 @@ func (w *WebServer) handleIndex(rw http.ResponseWriter, r *http.Request) {
 
 // Proxy topology requests to controller
 func (w *WebServer) handleTopology(rw http.ResponseWriter, r *http.Request) {
-	resp, err := http.Get(w.controllerURL + "/topology")
+	resp, err := w.httpClient.Get(w.controllerURL + "/topology")
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -47,23 +62,14 @@ func (w *WebServer) handleTopology(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(resp.StatusCode)
 	
-	// Copy response body
-	buf := make([]byte, 1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			rw.Write(buf[:n])
-		}
-		if err != nil {
-			break
-		}
-	}
+	// Use io.Copy for efficient streaming
+	io.Copy(rw, resp.Body)
 }
 
 // Get aggregated grid state from all nodes
 func (w *WebServer) handleGridState(rw http.ResponseWriter, r *http.Request) {
 	// First get topology to know all nodes
-	topologyResp, err := http.Get(w.controllerURL + "/topology")
+	topologyResp, err := w.httpClient.Get(w.controllerURL + "/topology")
 	if err != nil {
 		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
 		return
@@ -108,8 +114,7 @@ func (w *WebServer) handleGridState(rw http.ResponseWriter, r *http.Request) {
 			}
 
 			// Get state from this node with timeout
-			client := &http.Client{Timeout: 2 * time.Second}
-			stateResp, err := client.Get(endpoint + "/state")
+			stateResp, err := w.httpClient.Get(endpoint + "/state")
 			if err != nil {
 				log.Printf("Failed to get state from %s: %v", endpoint, err)
 				resultChan <- nodeResult{pos, nil, err}
@@ -156,7 +161,7 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 	log.Printf("Grid click: global (%d, %d)", req.GlobalX, req.GlobalY)
 
 	// Get topology first to find the correct node mapping
-	topologyResp, err := http.Get(w.controllerURL + "/topology")
+	topologyResp, err := w.httpClient.Get(w.controllerURL + "/topology")
 	if err != nil {
 		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
 		return
@@ -216,8 +221,7 @@ func (w *WebServer) handleCellClick(rw http.ResponseWriter, r *http.Request) {
 	log.Printf("Randomizing grid for node %s at endpoint: %s", podId, endpoint)
 
 	// Send randomize command to the specific node
-	client := &http.Client{Timeout: 2 * time.Second}
-	randomizeResp, err := client.Post(endpoint+"/randomize", "application/json", nil)
+	randomizeResp, err := w.httpClient.Post(endpoint+"/randomize", "application/json", nil)
 	if err != nil {
 		log.Printf("Failed to randomize %s: %v", podId, err)
 		http.Error(rw, "Failed to randomize grid", http.StatusServiceUnavailable)
@@ -239,7 +243,7 @@ func (w *WebServer) handleRandomizeAll(rw http.ResponseWriter, r *http.Request) 
 	log.Printf("Randomizing all nodes...")
 	
 	// First get topology to know all nodes
-	topologyResp, err := http.Get(w.controllerURL + "/topology")
+	topologyResp, err := w.httpClient.Get(w.controllerURL + "/topology")
 	if err != nil {
 		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
 		return
@@ -291,8 +295,7 @@ func (w *WebServer) handleRandomizeAll(rw http.ResponseWriter, r *http.Request) 
 			podId, _ := nodeMap["podId"].(string)
 
 			// Send randomize command with timeout
-			client := &http.Client{Timeout: 2 * time.Second}
-			randomizeResp, err := client.Post(endpoint+"/randomize", "application/json", nil)
+			randomizeResp, err := w.httpClient.Post(endpoint+"/randomize", "application/json", nil)
 			if err != nil {
 				log.Printf("Failed to randomize %s: %v", podId, err)
 				resultChan <- nodeResult{podId, err}
