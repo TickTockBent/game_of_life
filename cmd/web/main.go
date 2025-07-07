@@ -66,88 +66,27 @@ func (w *WebServer) handleTopology(rw http.ResponseWriter, r *http.Request) {
 	io.Copy(rw, resp.Body)
 }
 
-// Get aggregated grid state from all nodes
+// Get aggregated grid state from controller
 func (w *WebServer) handleGridState(rw http.ResponseWriter, r *http.Request) {
-	// First get topology to know all nodes
-	topologyResp, err := w.httpClient.Get(w.controllerURL + "/topology")
+	// Fetch aggregated state from controller
+	resp, err := w.httpClient.Get(w.controllerURL + "/aggregated-state")
 	if err != nil {
-		http.Error(rw, "Failed to get topology", http.StatusServiceUnavailable)
+		http.Error(rw, "Failed to get aggregated state", http.StatusServiceUnavailable)
 		return
 	}
-	defer topologyResp.Body.Close()
+	defer resp.Body.Close()
 
-	var topology map[string]interface{}
-	if err := json.NewDecoder(topologyResp.Body).Decode(&topology); err != nil {
-		http.Error(rw, "Failed to parse topology", http.StatusInternalServerError)
-		return
-	}
-
-	nodes, ok := topology["nodes"].(map[string]interface{})
-	if !ok {
-		http.Error(rw, "Invalid topology format", http.StatusInternalServerError)
+	if resp.StatusCode != 200 {
+		http.Error(rw, fmt.Sprintf("Controller returned status %d", resp.StatusCode), http.StatusServiceUnavailable)
 		return
 	}
 
-	// Collect state from all nodes in parallel
-	gridStates := make(map[string]interface{})
-	type nodeResult struct {
-		position string
-		state    map[string]interface{}
-		err      error
-	}
-	
-	resultChan := make(chan nodeResult, len(nodes))
-	
-	// Start goroutines for each node
-	for posStr, nodeInterface := range nodes {
-		go func(pos string, nodeIface interface{}) {
-			nodeMap, ok := nodeIface.(map[string]interface{})
-			if !ok {
-				resultChan <- nodeResult{pos, nil, fmt.Errorf("invalid node format")}
-				return
-			}
-
-			endpoint, ok := nodeMap["endpoint"].(string)
-			if !ok {
-				resultChan <- nodeResult{pos, nil, fmt.Errorf("invalid endpoint")}
-				return
-			}
-
-			// Get state from this node with timeout
-			stateResp, err := w.httpClient.Get(endpoint + "/state")
-			if err != nil {
-				log.Printf("Failed to get state from %s: %v", endpoint, err)
-				resultChan <- nodeResult{pos, nil, err}
-				return
-			}
-			defer stateResp.Body.Close()
-
-			var nodeState map[string]interface{}
-			if err := json.NewDecoder(stateResp.Body).Decode(&nodeState); err != nil {
-				log.Printf("Failed to parse state from %s: %v", endpoint, err)
-				resultChan <- nodeResult{pos, nil, err}
-				return
-			}
-
-			resultChan <- nodeResult{pos, nodeState, nil}
-		}(posStr, nodeInterface)
-	}
-	
-	// Collect results
-	for i := 0; i < len(nodes); i++ {
-		result := <-resultChan
-		if result.err == nil && result.state != nil {
-			gridStates[result.position] = result.state
-		}
-	}
-
-	response := map[string]interface{}{
-		"topology": topology,
-		"grids":    gridStates,
-	}
-
+	// Stream the response directly to client
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(response)
+	rw.WriteHeader(resp.StatusCode)
+	
+	// Use io.Copy for efficient streaming
+	io.Copy(rw, resp.Body)
 }
 
 // Handle grid click - randomize the clicked grid
@@ -333,6 +272,46 @@ func (w *WebServer) handleRandomizeAll(rw http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(rw).Encode(response)
 }
 
+// handleMetrics fetches and combines controller metrics with pod information
+func (w *WebServer) handleMetrics(rw http.ResponseWriter, r *http.Request) {
+	// Fetch controller metrics
+	controllerMetrics, err := w.fetchControllerMetrics()
+	if err != nil {
+		log.Printf("Error fetching controller metrics: %v", err)
+		http.Error(rw, "Failed to fetch metrics", http.StatusInternalServerError)
+		return
+	}
+
+	// Combine all metrics
+	response := map[string]interface{}{
+		"controller": controllerMetrics,
+		"timestamp":  time.Now().Unix(),
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(response)
+}
+
+// fetchControllerMetrics gets metrics from the controller
+func (w *WebServer) fetchControllerMetrics() (map[string]interface{}, error) {
+	resp, err := w.httpClient.Get(w.controllerURL + "/metrics")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("controller metrics returned status %d", resp.StatusCode)
+	}
+
+	var metrics map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
+		return nil, err
+	}
+
+	return metrics, nil
+}
+
 func main() {
 	webServer := NewWebServer()
 
@@ -347,6 +326,7 @@ func main() {
 	r.HandleFunc("/api/grid", webServer.handleGridState).Methods("GET")
 	r.HandleFunc("/api/click", webServer.handleCellClick).Methods("POST")
 	r.HandleFunc("/api/randomize", webServer.handleRandomizeAll).Methods("POST")
+	r.HandleFunc("/api/metrics", webServer.handleMetrics).Methods("GET")
 	
 	// Main page
 	r.HandleFunc("/", webServer.handleIndex).Methods("GET")

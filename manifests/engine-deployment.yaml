@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gameoflife-engine
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+    component: engine
+spec:
+  replicas: 21  # 3 pods per 7 nodes
+  selector:
+    matchLabels:
+      app: gameoflife
+      component: engine
+  template:
+    metadata:
+      labels:
+        app: gameoflife
+        component: engine
+    spec:
+      imagePullSecrets:
+      - name: registry-secret
+      # Spread pods across nodes but allow multiple per node
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: component
+                  operator: In
+                  values: ["engine"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: engine
+        image: registry.ticktockbent.com/gameoflife-engine:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: CONTROLLER_URL
+          value: "https://gameoflife-api.ticktockbent.com"
+        - name: SELF_ENDPOINT
+          value: "http://$(POD_IP):8080"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 5
+      # Tolerate all taints so engine can run on any node
+      tolerations:
+      - operator: Exists

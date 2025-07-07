@@ -29,6 +29,14 @@ type Controller struct {
 	lastStepTime    time.Time
 	nodeReadyTimes  map[int]time.Time
 	timingMu        sync.RWMutex
+	// Additional metrics
+	forceStepCount     int64
+	reregistPrompts    int64
+	reregistSuccesses  int64
+	reregistFailures   int64
+	// State aggregation
+	gridStates    map[int]*GridState
+	stateMu       sync.RWMutex
 }
 
 type RegisterRequest struct {
@@ -46,6 +54,26 @@ type TopologyResponse struct {
 	Nodes    map[int]*controller.NodeInfo   `json:"nodes"`
 }
 
+type GridState struct {
+	Grid       [][]bool `json:"grid"`
+	Generation int      `json:"generation"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type StateUpdateRequest struct {
+	Grid       [][]bool `json:"grid"`
+	Generation int      `json:"generation"`
+}
+
+type AggregatedStateResponse struct {
+	Topology *TopologyResponse            `json:"topology"`
+	Grids    map[string]*GridState        `json:"grids"`
+}
+
+type HaloResponse struct {
+	HaloCells [9][9]bool `json:"haloCells"` // 9x9 grid with center 7x7 being the node's area
+}
+
 func NewController() *Controller {
 	regionID := os.Getenv("REGION_ID")
 	if regionID == "" {
@@ -58,6 +86,7 @@ func NewController() *Controller {
 		lastStatsLog: time.Now(),
 		lastStepTime: time.Now(),
 		nodeReadyTimes: make(map[int]time.Time),
+		gridStates: make(map[int]*GridState),
 	}
 	
 	// Start request statistics logging
@@ -132,6 +161,7 @@ func (c *Controller) barrierSyncLoop() {
 			c.timingMu.RUnlock()
 			
 			if time.Since(lastStep) > 1*time.Second {
+				atomic.AddInt64(&c.forceStepCount, 1)
 				log.Printf("Force stepping %d/%d ready nodes after 1s timeout", readyCount, len(nodes))
 				c.broadcastStepToReady(nodes)
 				c.updateLastStepTime()
@@ -156,6 +186,7 @@ func (c *Controller) checkAllEnginesReady(nodes map[int]*controller.NodeInfo) in
 			// Check if node has been unready too long
 			if lastReady, exists := c.nodeReadyTimes[position]; exists {
 				if now.Sub(lastReady) > 1*time.Second {
+					atomic.AddInt64(&c.reregistPrompts, 1)
 					log.Printf("Node %s unready for >1s, prompting re-registration", node.PodID)
 					c.promptReregistration(node)
 					delete(c.nodeReadyTimes, position) // Reset timer
@@ -374,6 +405,58 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+// handleStateUpdate receives state updates from engine pods
+func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	position, err := strconv.Atoi(vars["position"])
+	if err != nil {
+		http.Error(w, "Invalid position", http.StatusBadRequest)
+		return
+	}
+
+	var req StateUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Store the state update
+	c.stateMu.Lock()
+	c.gridStates[position] = &GridState{
+		Grid:       req.Grid,
+		Generation: req.Generation,
+		UpdatedAt:  time.Now(),
+	}
+	c.stateMu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleAggregatedState returns all current grid states for the web interface
+func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Request) {
+	// Get topology
+	topology := &TopologyResponse{
+		RegionID: c.regionID,
+		Nodes:    c.topology.GetAllNodes(),
+	}
+
+	// Get all grid states, converting position int to string for JSON compatibility
+	c.stateMu.RLock()
+	grids := make(map[string]*GridState)
+	for position, state := range c.gridStates {
+		grids[strconv.Itoa(position)] = state
+	}
+	c.stateMu.RUnlock()
+
+	response := &AggregatedStateResponse{
+		Topology: topology,
+		Grids:    grids,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // Old barrier sync handlers removed - now using polling approach
 
 func main() {
@@ -395,6 +478,13 @@ func main() {
 	
 	// Health check
 	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
+	
+	// State aggregation endpoints
+	r.HandleFunc("/state/{position}", controller.handleStateUpdate).Methods("POST")
+	r.HandleFunc("/aggregated-state", controller.handleAggregatedState).Methods("GET")
+	
+	// Metrics endpoint
+	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
 	
 	// Removed old barrier sync endpoints - now using polling
 	
@@ -437,14 +527,17 @@ func (c *Controller) promptReregistration(node *controller.NodeInfo) {
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Post(node.Endpoint+"/force-reregister", "application/json", nil)
 		if err != nil {
+			atomic.AddInt64(&c.reregistFailures, 1)
 			log.Printf("Failed to prompt re-registration for %s: %v", node.PodID, err)
 			return
 		}
 		defer resp.Body.Close()
 		
 		if resp.StatusCode != 200 {
+			atomic.AddInt64(&c.reregistFailures, 1)
 			log.Printf("Force re-registration failed for %s: %d", node.PodID, resp.StatusCode)
 		} else {
+			atomic.AddInt64(&c.reregistSuccesses, 1)
 			log.Printf("Successfully prompted re-registration for %s", node.PodID)
 		}
 	}()
@@ -455,4 +548,50 @@ func (c *Controller) updateLastStepTime() {
 	c.timingMu.Lock()
 	c.lastStepTime = time.Now()
 	c.timingMu.Unlock()
+}
+
+// handleMetrics returns detailed system metrics for monitoring
+func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	nodes := c.topology.GetAllNodes()
+	
+	// Count ready nodes
+	readyCount := 0
+	for _, node := range nodes {
+		if c.isEngineReady(node) {
+			readyCount++
+		}
+	}
+	
+	c.timingMu.RLock()
+	lastStep := c.lastStepTime
+	c.timingMu.RUnlock()
+	
+	metrics := map[string]interface{}{
+		"timestamp": time.Now().Unix(),
+		"nodes": map[string]interface{}{
+			"total":      len(nodes),
+			"ready":      readyCount,
+			"unready":    len(nodes) - readyCount,
+			"readyPct":   float64(readyCount) / float64(len(nodes)) * 100,
+		},
+		"requests": map[string]interface{}{
+			"total":         atomic.LoadInt64(&c.requestCounter),
+			"registrations": atomic.LoadInt64(&c.registrations),
+			"health":        atomic.LoadInt64(&c.healthChecks),
+			"neighbors":     atomic.LoadInt64(&c.neighborLookups),
+		},
+		"safeguards": map[string]interface{}{
+			"forceSteps":        atomic.LoadInt64(&c.forceStepCount),
+			"reregistPrompts":   atomic.LoadInt64(&c.reregistPrompts),
+			"reregistSuccesses": atomic.LoadInt64(&c.reregistSuccesses),
+			"reregistFailures":  atomic.LoadInt64(&c.reregistFailures),
+		},
+		"timing": map[string]interface{}{
+			"lastStepAge":    time.Since(lastStep).Milliseconds(),
+			"regionId":       c.regionID,
+		},
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
 }
