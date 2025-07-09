@@ -16,6 +16,13 @@ spec:
   - host: gameoflife.ticktockbent.com
     http:
       paths:
+      - path: /metrics
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
       - path: /
         pathType: Prefix
         backend:
