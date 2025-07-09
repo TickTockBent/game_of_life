@@ -105,3 +105,7 @@ spec:
             name: gameoflife-controller
             port:
               number: 8081
+  tls:
+  - hosts:
+    - gameoflife-api.ticktockbent.com
+    secretName: gameoflife-api-tls

@@ -2,12 +2,39 @@
 
 # Fast parallel build script for Game of Life
 
-REGISTRY="${REGISTRY:-registry.ticktockbent.com}"
+REGISTRY="${REGISTRY:-192.168.68.100:5000}"
 VERSION="${VERSION:-latest}"
 
 echo "🚀 Starting parallel multi-arch builds..."
 echo "Registry: $REGISTRY"
 echo "Version: $VERSION"
+
+# Check if we're authenticated to the registry
+echo "🔐 Checking registry authentication..."
+if ! docker pull $REGISTRY/gameoflife-engine:latest &>/dev/null; then
+    echo "⚠️  Not authenticated to registry, running auth setup..."
+    export VAULT_ADDR='http://192.168.68.100:8200'
+    if [ -f "./scripts/setup-registry-auth.sh" ]; then
+        ./scripts/setup-registry-auth.sh
+    else
+        echo "❌ Error: setup-registry-auth.sh not found"
+        exit 1
+    fi
+fi
+
+# Ensure we have the right builder with insecure registry support
+echo "🔧 Configuring buildx for insecure registry..."
+if ! docker buildx inspect gameoflife-builder &>/dev/null; then
+    echo "Creating buildx builder with insecure registry support..."
+    cat > /tmp/buildkit.toml <<EOF
+[registry."192.168.68.100:5000"]
+  http = true
+  insecure = true
+EOF
+    docker buildx create --name gameoflife-builder --driver docker-container --buildkitd-config /tmp/buildkit.toml --use --bootstrap
+else
+    docker buildx use gameoflife-builder
+fi
 
 # Function to build a single service
 build_service() {
@@ -15,6 +42,13 @@ build_service() {
     local dockerfile=$2
     
     echo "🔨 Building $service..."
+    
+    # Check if dockerfile exists
+    if [ ! -f "$dockerfile" ]; then
+        echo "❌ $service: Dockerfile $dockerfile not found"
+        echo "1" > "/tmp/build_result_$service"
+        return 1
+    fi
     
     start_time=$(date +%s)
     
@@ -29,8 +63,12 @@ build_service() {
     end_time=$(date +%s)
     duration=$((end_time - start_time))
     
+    # Write result to temp file for parent process
+    echo "$build_result" > "/tmp/build_result_$service"
+    
     if [ $build_result -eq 0 ]; then
         echo "✅ $service completed in ${duration}s"
+        return 0
     else
         echo "❌ $service failed after ${duration}s"
         return 1
@@ -53,13 +91,16 @@ WEB_PID=$!
 echo "Waiting for builds to complete..."
 
 wait $ENGINE_PID
-ENGINE_RESULT=$?
-
 wait $CONTROLLER_PID
-CONTROLLER_RESULT=$?
-
 wait $WEB_PID
-WEB_RESULT=$?
+
+# Read actual build results from temp files
+ENGINE_RESULT=$(cat "/tmp/build_result_engine" 2>/dev/null || echo "1")
+CONTROLLER_RESULT=$(cat "/tmp/build_result_controller" 2>/dev/null || echo "1")
+WEB_RESULT=$(cat "/tmp/build_result_web" 2>/dev/null || echo "1")
+
+# Cleanup temp files
+rm -f "/tmp/build_result_engine" "/tmp/build_result_controller" "/tmp/build_result_web"
 
 # Report results
 echo ""

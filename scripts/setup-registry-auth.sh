@@ -13,7 +13,7 @@ fi
 # Check if VAULT_ADDR is set
 if [ -z "$VAULT_ADDR" ]; then
     echo "Setting VAULT_ADDR to default..."
-    export VAULT_ADDR='http://127.0.0.1:8200'
+    export VAULT_ADDR='http://192.168.68.100:8200'
 fi
 
 # Check Vault connectivity
@@ -42,8 +42,8 @@ if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
 fi
 
 # Login to Docker registry
-echo "Logging in to registry.ticktockbent.com..."
-echo $PASSWORD | docker login registry.ticktockbent.com -u $USERNAME --password-stdin
+echo "Logging in to 192.168.68.100:5000..."
+echo $PASSWORD | docker login 192.168.68.100:5000 -u $USERNAME --password-stdin
 
 if [ $? -ne 0 ]; then
     echo "❌ Failed to login to Docker registry"
@@ -53,7 +53,7 @@ fi
 # Create Kubernetes secret for image pulls
 echo "Creating image pull secret in gameoflife namespace..."
 kubectl create secret docker-registry registry-secret \
-  --docker-server=registry.ticktockbent.com \
+  --docker-server=192.168.68.100:5000 \
   --docker-username=$USERNAME \
   --docker-password=$PASSWORD \
   --docker-email=admin@ticktockbent.com \

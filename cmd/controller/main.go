@@ -18,7 +18,6 @@ type Controller struct {
 	// Node registry
 	nodes      map[int]*NodeInfo
 	nodesMu    sync.RWMutex
-	nextPos    int
 	
 	// Grid state storage
 	gridStates map[int]*GridState
@@ -33,10 +32,16 @@ type Controller struct {
 }
 
 type NodeInfo struct {
-	PodID     string `json:"podId"`
-	Position  int    `json:"position"`
-	Endpoint  string `json:"endpoint"`
+	PodID        string    `json:"podId"`
+	Position     Position  `json:"position"`
+	Endpoint     string    `json:"endpoint"`
 	RegisteredAt time.Time `json:"registeredAt"`
+	LastHeartbeat time.Time `json:"lastHeartbeat"`
+}
+
+type Position struct {
+	Row int `json:"row"`
+	Col int `json:"col"`
 }
 
 type GridState struct {
@@ -90,6 +95,9 @@ func NewController() *Controller {
 	// Start generation advancement timer
 	go c.generationAdvancer()
 	
+	// Start health check timer
+	go c.healthChecker()
+	
 	return c
 }
 
@@ -102,6 +110,46 @@ func (c *Controller) generationAdvancer() {
 		c.generationMu.Lock()
 		c.currentGeneration++
 		c.generationMu.Unlock()
+	}
+}
+
+// healthChecker removes stale nodes that haven't sent heartbeats
+func (c *Controller) healthChecker() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		now := time.Now()
+		staleThreshold := 2 * time.Minute // Consider stale after 2 minutes
+		
+		c.nodesMu.Lock()
+		stalePods := []int{}
+		for pos, node := range c.nodes {
+			if now.Sub(node.LastHeartbeat) > staleThreshold {
+				stalePods = append(stalePods, pos)
+				log.Printf("Removing stale node %s at position %d (last heartbeat: %v ago)",
+					node.PodID, pos, now.Sub(node.LastHeartbeat))
+			}
+		}
+		
+		// Remove stale nodes and clean up their resources
+		for _, pos := range stalePods {
+			delete(c.nodes, pos)
+		}
+		c.nodesMu.Unlock()
+		
+		// Clean up grid states separately to avoid nested locks
+		if len(stalePods) > 0 {
+			c.stateMu.Lock()
+			for _, pos := range stalePods {
+				delete(c.gridStates, pos)
+			}
+			c.stateMu.Unlock()
+		}
+		
+		if len(stalePods) > 0 {
+			log.Printf("Health check removed %d stale nodes", len(stalePods))
+		}
 	}
 }
 
@@ -128,21 +176,48 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.nodesMu.Lock()
-	position := c.nextPos
-	c.nextPos++
 	
-	// Keep positions in 0-99 range for 10x10 grid
-	if position >= 100 {
+	// Check if this pod is already registered
+	for pos, node := range c.nodes {
+		if node.PodID == req.PodID {
+			// Update heartbeat for existing registration
+			node.LastHeartbeat = time.Now()
+			c.nodesMu.Unlock()
+			
+			response := RegisterResponse{Position: pos}
+			log.Printf("Re-registered existing node %s at position %d", req.PodID, pos)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+	
+	// Find first available position (reuse positions from removed nodes)
+	position := -1
+	for i := 0; i < 100; i++ {
+		if _, exists := c.nodes[i]; !exists {
+			position = i
+			break
+		}
+	}
+	
+	if position == -1 {
 		c.nodesMu.Unlock()
 		http.Error(w, "Grid full", http.StatusServiceUnavailable)
 		return
 	}
 	
+	// Convert position to row/col (10x10 grid layout)
+	row := position / 10
+	col := position % 10
+	
+	now := time.Now()
 	c.nodes[position] = &NodeInfo{
 		PodID:        req.PodID,
-		Position:     position,
+		Position:     Position{Row: row, Col: col},
 		Endpoint:     req.Endpoint,
-		RegisteredAt: time.Now(),
+		RegisteredAt: now,
+		LastHeartbeat: now,
 	}
 	c.nodesMu.Unlock()
 
@@ -168,6 +243,7 @@ func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update grid state
 	c.stateMu.Lock()
 	c.gridStates[position] = &GridState{
 		Grid:       req.Grid,
@@ -175,6 +251,13 @@ func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:  time.Now(),
 	}
 	c.stateMu.Unlock()
+	
+	// Update heartbeat for this node
+	c.nodesMu.Lock()
+	if node, exists := c.nodes[position]; exists {
+		node.LastHeartbeat = time.Now()
+	}
+	c.nodesMu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 }

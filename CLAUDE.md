@@ -160,3 +160,6 @@ make monitor
 - Kubernetes DaemonSet documentation
 - WebSocket API patterns
 - Distributed systems coordination patterns
+
+## Deployment Warnings
+- When redeploying, do not delete the namespace as that also removes the TLS and registry auth secrets.

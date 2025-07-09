@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -44,10 +45,18 @@ func NewEngine() *Engine {
 		controllerURL = "https://gameoflife-api.ticktockbent.com"
 	}
 
+	log.Printf("DEBUG: Creating HTTP client with 5s timeout")
 	httpClient := &http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives:   true,  // Theory 2: Disable connection reuse
+			MaxIdleConns:        0,     // Theory 2: No connection pooling
+			IdleConnTimeout:     0,     // Theory 2: No idle connections
+			TLSHandshakeTimeout: 3 * time.Second, // Theory 1: Longer TLS timeout
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second, // Theory 3: Longer dial timeout
+			}).DialContext,
 		},
 	}
 
@@ -68,7 +77,7 @@ func NewEngine() *Engine {
 
 // Start begins the engine lifecycle
 func (e *Engine) Start() {
-	log.Printf("Starting engine %s", e.nodeID)
+	log.Printf("Starting engine %s with controller URL: %s", e.nodeID, e.controllerURL)
 	
 	// 1. Register with controller
 	e.register()
@@ -83,7 +92,7 @@ func (e *Engine) Start() {
 // register with controller to get position
 func (e *Engine) register() {
 	for !e.registered {
-		log.Printf("Attempting registration...")
+		log.Printf("Attempting registration to %s/register", e.controllerURL)
 		
 		reqData := map[string]string{
 			"podId":    e.nodeID,
@@ -91,9 +100,14 @@ func (e *Engine) register() {
 		}
 		
 		jsonData, _ := json.Marshal(reqData)
+		start := time.Now()
 		resp, err := e.httpClient.Post(e.controllerURL+"/register", "application/json", strings.NewReader(string(jsonData)))
+		elapsed := time.Since(start)
 		if err != nil {
-			log.Printf("Registration failed: %v", err)
+			log.Printf("Registration failed after %v: %v (Type: %T)", elapsed, err, err)
+			if netErr, ok := err.(net.Error); ok {
+				log.Printf("DEBUG: Network error during registration - Timeout: %v, Temporary: %v", netErr.Timeout(), netErr.Temporary())
+			}
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -199,11 +213,22 @@ func (e *Engine) getHalo() ([9][9]bool, error) {
 // getControllerGeneration fetches current generation from controller
 func (e *Engine) getControllerGeneration() (int, error) {
 	url := fmt.Sprintf("%s/generation", e.controllerURL)
+	log.Printf("DEBUG: Attempting to GET %s", url)
+	
+	start := time.Now()
 	resp, err := e.httpClient.Get(url)
+	elapsed := time.Since(start)
+	
 	if err != nil {
+		log.Printf("DEBUG: HTTP GET failed after %v: %v (Type: %T)", elapsed, err, err)
+		if netErr, ok := err.(net.Error); ok {
+			log.Printf("DEBUG: Network error - Timeout: %v, Temporary: %v", netErr.Timeout(), netErr.Temporary())
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
+
+	log.Printf("DEBUG: HTTP GET succeeded after %v, status: %d", elapsed, resp.StatusCode)
 
 	if resp.StatusCode != 200 {
 		return 0, fmt.Errorf("status %d", resp.StatusCode)

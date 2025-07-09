@@ -43,8 +43,8 @@ class GameOfLifeVisualizer {
             }
         };
         
-        // Fast refresh rate now that we only call controller once
-        this.refreshInterval = setInterval(refreshData, 100); // Back to 100ms
+        // Smooth refresh rate for better user experience
+        this.refreshInterval = setInterval(refreshData, 200); // 200ms for smoother updates
     }
     
     async refreshData() {
@@ -52,15 +52,33 @@ class GameOfLifeVisualizer {
         
         this.isUpdating = true;
         try {
-            const response = await fetch('/api/grid');
+            const response = await fetch('/api/grid', {
+                signal: AbortSignal.timeout(5000) // 5 second timeout
+            });
             if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+                // Handle 503/500 errors gracefully - don't spam logs
+                if (response.status >= 500) {
+                    console.warn(`Server error ${response.status} - will retry`);
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return; // Skip update, keep current state
             }
             
             const data = await response.json();
             
             // Only update if we got valid data
             if (data.grids && data.topology) {
+                // Merge new data with existing to prevent flickering
+                if (this.gridData) {
+                    // Keep existing grids if new data is missing them
+                    for (const position in this.gridData) {
+                        if (!data.grids[position]) {
+                            data.grids[position] = this.gridData[position];
+                        }
+                    }
+                }
+                
                 this.gridData = data.grids;
                 this.topology = data.topology;
                 this.lastUpdateTime = Date.now();
@@ -94,8 +112,18 @@ class GameOfLifeVisualizer {
         if (!this.topology) return;
         
         const nodeCount = Object.keys(this.topology.nodes || {}).length;
-        document.getElementById('nodeCount').textContent = nodeCount;
-        document.getElementById('regionId').textContent = this.topology.regionId || '-';
+        
+        // Only update if values actually changed
+        const nodeCountEl = document.getElementById('nodeCount');
+        if (nodeCountEl.textContent !== nodeCount.toString()) {
+            nodeCountEl.textContent = nodeCount;
+        }
+        
+        const regionIdEl = document.getElementById('regionId');
+        const regionId = this.topology.regionId || '-';
+        if (regionIdEl.textContent !== regionId) {
+            regionIdEl.textContent = regionId;
+        }
         
         // Calculate grid dimensions (assuming 7x7 per node)
         const maxRow = Math.max(...Object.values(this.topology.nodes).map(n => n.position.row)) + 1;
@@ -109,24 +137,45 @@ class GameOfLifeVisualizer {
         if (!this.topology) return;
         
         const nodeGrid = document.getElementById('nodeGrid');
-        nodeGrid.innerHTML = '';
         
-        Object.entries(this.topology.nodes).forEach(([position, node]) => {
-            const nodeCard = document.createElement('div');
-            nodeCard.className = 'node-card';
+        // Check if topology changed - only rebuild if nodes changed
+        const currentNodeIds = Object.keys(this.topology.nodes).sort().join(',');
+        if (this.lastNodeIds !== currentNodeIds) {
+            // Full rebuild needed
+            nodeGrid.innerHTML = '';
             
-            const gridState = this.gridData[position];
-            const generation = gridState ? gridState.generation : 0;
+            Object.entries(this.topology.nodes).forEach(([position, node]) => {
+                const nodeCard = document.createElement('div');
+                nodeCard.className = 'node-card';
+                nodeCard.id = `node-${position}`;
+                
+                const gridState = this.gridData[position];
+                const generation = gridState ? gridState.generation : 0;
+                
+                nodeCard.innerHTML = `
+                    <h4>Node ${node.podId}</h4>
+                    <p>Position: (${node.position.row}, ${node.position.col})</p>
+                    <p class="generation">Generation: ${generation}</p>
+                `;
+                
+                nodeGrid.appendChild(nodeCard);
+            });
             
-            nodeCard.innerHTML = `
-                <h4>Node ${node.podId}</h4>
-                <p>Position: (${node.position.row}, ${node.position.col})</p>
-                <p>Generation: ${generation}</p>
-                <p>Endpoint: ${node.endpoint}</p>
-            `;
-            
-            nodeGrid.appendChild(nodeCard);
-        });
+            this.lastNodeIds = currentNodeIds;
+        } else {
+            // Just update generation numbers
+            Object.entries(this.topology.nodes).forEach(([position, node]) => {
+                const nodeCard = document.getElementById(`node-${position}`);
+                if (nodeCard) {
+                    const gridState = this.gridData[position];
+                    const generation = gridState ? gridState.generation : 0;
+                    const genElement = nodeCard.querySelector('.generation');
+                    if (genElement) {
+                        genElement.textContent = `Generation: ${generation}`;
+                    }
+                }
+            });
+        }
     }
     
     draw() {
@@ -139,18 +188,69 @@ class GameOfLifeVisualizer {
         const canvasWidth = maxCol * 7 * this.cellSize;
         const canvasHeight = maxRow * 7 * this.cellSize;
         
+        // Only resize if dimensions actually changed
         if (this.canvas.width !== canvasWidth || this.canvas.height !== canvasHeight) {
             this.canvas.width = canvasWidth;
             this.canvas.height = canvasHeight;
+            // Full redraw needed after resize
+            this.lastGridStates = null;
         }
         
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        // Initialize previous state tracking
+        if (!this.lastGridStates) {
+            this.lastGridStates = {};
+            // Full clear and redraw on first run
+            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+            this.drawAllGrids();
+        } else {
+            // Incremental updates only
+            this.drawChangedGrids();
+        }
         
+        // Always draw borders on top
+        this.drawAllBorders();
+        
+        // Update saved state
+        this.lastGridStates = JSON.parse(JSON.stringify(this.gridData));
+    }
+    
+    drawAllGrids() {
         Object.entries(this.topology.nodes).forEach(([position, node]) => {
             const gridState = this.gridData[position];
+            if (gridState && gridState.grid) {
+                this.drawNodeGrid(node, gridState.grid);
+            }
+        });
+    }
+    
+    drawChangedGrids() {
+        Object.entries(this.topology.nodes).forEach(([position, node]) => {
+            const gridState = this.gridData[position];
+            const lastGridState = this.lastGridStates[position];
+            
+            // Skip if no current data (keep previous rendering)
             if (!gridState || !gridState.grid) return;
             
-            this.drawNodeGrid(node, gridState.grid);
+            // Check if this grid changed
+            const hasChanged = !lastGridState || 
+                              !lastGridState.grid ||
+                              gridState.generation !== lastGridState.generation ||
+                              JSON.stringify(gridState.grid) !== JSON.stringify(lastGridState.grid);
+            
+            if (hasChanged) {
+                // Clear only this grid's area
+                const startX = node.position.col * 7 * this.cellSize;
+                const startY = node.position.row * 7 * this.cellSize;
+                this.ctx.clearRect(startX, startY, 7 * this.cellSize, 7 * this.cellSize);
+                
+                // Redraw this grid
+                this.drawNodeGrid(node, gridState.grid);
+            }
+        });
+    }
+    
+    drawAllBorders() {
+        Object.entries(this.topology.nodes).forEach(([position, node]) => {
             this.drawNodeBorder(node);
         });
     }
@@ -291,49 +391,43 @@ class GameOfLifeVisualizer {
     
     async updateMetrics() {
         try {
-            const response = await fetch('/api/metrics');
-            const data = await response.json();
+            const response = await fetch('/metrics', {
+                signal: AbortSignal.timeout(3000) // 3 second timeout for metrics
+            });
             
-            if (data.controller) {
-                const metrics = data.controller;
-                
-                // Node readiness
-                if (metrics.nodes) {
-                    const readyPct = Math.round(metrics.nodes.readyPct || 0);
-                    document.getElementById('nodeReady').textContent = 
-                        `${metrics.nodes.ready || 0}/${metrics.nodes.total || 0} (${readyPct}%)`;
+            if (!response.ok) {
+                // Handle server errors gracefully for metrics
+                if (response.status >= 500) {
+                    console.warn(`Metrics server error ${response.status} - skipping update`);
+                    return;
+                }
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const metrics = await response.json();
+            
+            if (metrics) {
+                // Current generation from controller
+                if (metrics.generation !== undefined) {
+                    document.getElementById('controllerLoad').textContent = `Gen ${metrics.generation}`;
                 }
                 
-                // Controller load (total requests)
-                if (metrics.requests) {
-                    const total = metrics.requests.total || 0;
-                    const health = metrics.requests.health || 0;
-                    const regs = metrics.requests.registrations || 0;
-                    document.getElementById('controllerLoad').textContent = 
-                        `${total} (${health}h ${regs}r)`;
+                // Registration count  
+                if (metrics.nodes !== undefined) {
+                    document.getElementById('forceSteps').textContent = `${metrics.nodes} nodes`;
+                    document.getElementById('nodeReady').textContent = `${metrics.nodes} ready`;
                 }
                 
-                // Force steps
-                if (metrics.safeguards) {
-                    document.getElementById('forceSteps').textContent = 
-                        metrics.safeguards.forceSteps || 0;
-                    
-                    // Re-registrations (prompts/successes/failures)
-                    const prompts = metrics.safeguards.reregistPrompts || 0;
-                    const successes = metrics.safeguards.reregistSuccesses || 0;
-                    const failures = metrics.safeguards.reregistFailures || 0;
-                    document.getElementById('reregistrations').textContent = 
-                        `${prompts}p ${successes}s ${failures}f`;
+                // Active grids count
+                if (metrics.activeGrids !== undefined) {
+                    document.getElementById('reregistrations').textContent = `${metrics.activeGrids} active`;
                 }
                 
-                // Last step timing
-                if (metrics.timing) {
-                    const lastStepAge = metrics.timing.lastStepAge || 0;
-                    if (lastStepAge < 1000) {
-                        document.getElementById('lastStep').textContent = `${lastStepAge}ms ago`;
-                    } else {
-                        document.getElementById('lastStep').textContent = `${Math.round(lastStepAge/1000)}s ago`;
-                    }
+                // Timestamp of last update
+                if (metrics.timestamp) {
+                    const now = Math.floor(Date.now() / 1000);
+                    const age = now - metrics.timestamp;
+                    document.getElementById('lastStep').textContent = `${age}s ago`;
                 }
             }
         } catch (error) {
