@@ -22,7 +22,7 @@ spec:
       - name: registry-secret
       containers:
       - name: controller
-        image: registry.ticktockbent.com/gameoflife-controller:latest
+        image: 192.168.68.100:5000/gameoflife-controller:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8081

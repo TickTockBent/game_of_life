@@ -7,7 +7,7 @@ metadata:
     app: gameoflife
     component: engine
 spec:
-  replicas: 21  # 3 pods per 7 nodes
+  replicas: 5  # Initial test deployment
   selector:
     matchLabels:
       app: gameoflife
@@ -34,7 +34,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: engine
-        image: registry.ticktockbent.com/gameoflife-engine:latest
+        image: 192.168.68.100:5000/gameoflife-engine:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

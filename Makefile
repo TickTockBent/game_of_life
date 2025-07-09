@@ -1,6 +1,6 @@
-.PHONY: build run test docker-build docker-push docker-run clean setup-auth deploy
+.PHONY: build run test docker-build docker-push docker-run clean setup-auth deploy registry-auth
 
-DOCKER_REGISTRY ?= registry.ticktockbent.com
+DOCKER_REGISTRY ?= 192.168.68.100:5000
 VERSION ?= latest
 
 build:
@@ -41,8 +41,14 @@ docker-fast:
 setup-auth:
 	./scripts/setup-registry-auth.sh
 
-deploy: setup-auth docker-push
+registry-auth:
+	@export VAULT_ADDR='http://192.168.68.100:8200' && ./scripts/setup-registry-auth.sh
+
+deploy: docker-push
 	kubectl apply -f manifests/
+
+deploy-fresh: registry-auth deploy
+	@echo "Fresh deployment with registry auth completed"
 
 local-test:
 	@echo "Starting local test server..."

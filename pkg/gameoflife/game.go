@@ -24,9 +24,21 @@ type Grid struct {
 	// Neighbor endpoints for communication
 	neighbors map[string]string
 	crosstalkEnabled bool
-	// Boring threshold tracking
+	// Staleness detection
 	emptyGenerations int
 	boringThreshold  int
+	
+	// Oscillation detection - store last few states
+	stateHistory [][GridSize][GridSize]Cell
+	historyIndex int
+	historySize  int
+	stableGenerations int
+	oscillationThreshold int
+	
+	// Low activity detection
+	lastChangedCells int
+	lowActivityThreshold int
+	lowActivityGenerations int
 }
 
 func NewGrid() *Grid {
@@ -36,6 +48,10 @@ func NewGrid() *Grid {
 	edgeData["south"] = make([]bool, GridSize)
 	edgeData["east"] = make([]bool, GridSize)
 	edgeData["west"] = make([]bool, GridSize)
+	
+	// Initialize state history for oscillation detection
+	historySize := 5 // Track last 5 states to detect cycles
+	stateHistory := make([][GridSize][GridSize]Cell, historySize)
 	
 	return &Grid{
 		neighbors: make(map[string]string),
@@ -49,6 +65,12 @@ func NewGrid() *Grid {
 		haloWest:  make([]bool, GridSize),
 		// Pre-allocate state array 
 		stateArray: make([][GridSize]bool, GridSize),
+		// Staleness detection
+		stateHistory: stateHistory,
+		historySize: historySize,
+		oscillationThreshold: 50, // Detect stable patterns after 50 generations
+		lowActivityThreshold: 3,  // Less than 3 cells changing = low activity
+		lowActivityGenerations: 0,
 	}
 }
 
@@ -141,20 +163,18 @@ func (g *Grid) ComputeNextGeneration() {
 
 // CommitNextGeneration commits the computed next generation
 func (g *Grid) CommitNextGeneration() {
+	// Count cells that changed this generation
+	changedCells := g.countChangedCells()
+	
+	// Store current state in history for oscillation detection
+	g.storeCurrentState()
+	
 	// Copy NextGen to Cells and increment generation
 	g.Cells = g.NextGen
 	g.Generation++
 	
-	// Update boring threshold tracking
-	if g.isEmpty() {
-		g.emptyGenerations++
-		if g.emptyGenerations >= g.boringThreshold {
-			g.RandomSeed(0.3) // Auto-randomize when boring
-			g.emptyGenerations = 0
-		}
-	} else {
-		g.emptyGenerations = 0
-	}
+	// Update staleness tracking
+	g.updateStalenessDetection(changedCells)
 }
 
 // NextGeneration keeps backward compatibility (compute + commit in one call)
@@ -266,5 +286,125 @@ func (g *Grid) UpdateHaloRegion(direction string, edgeData []bool) {
 		g.haloEast = edgeData
 	case "west":
 		g.haloWest = edgeData
+	}
+}
+
+// countChangedCells counts how many cells changed from current to next generation
+func (g *Grid) countChangedCells() int {
+	count := 0
+	for x := 0; x < GridSize; x++ {
+		for y := 0; y < GridSize; y++ {
+			if g.Cells[x][y] != g.NextGen[x][y] {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// storeCurrentState saves current state to history buffer for oscillation detection
+func (g *Grid) storeCurrentState() {
+	g.stateHistory[g.historyIndex] = g.Cells
+	g.historyIndex = (g.historyIndex + 1) % g.historySize
+}
+
+// updateStalenessDetection updates all staleness counters and triggers randomization if needed
+func (g *Grid) updateStalenessDetection(changedCells int) {
+	// Empty grid detection (existing)
+	if g.isEmpty() {
+		g.emptyGenerations++
+		if g.emptyGenerations >= g.boringThreshold {
+			g.RandomSeed(0.3) // Auto-randomize when boring
+			g.resetStalenessCounters()
+			return
+		}
+	} else {
+		g.emptyGenerations = 0
+	}
+	
+	// Low activity detection
+	if changedCells <= g.lowActivityThreshold {
+		g.lowActivityGenerations++
+	} else {
+		g.lowActivityGenerations = 0
+	}
+	
+	// Oscillation detection
+	if g.Generation > g.historySize && g.isOscillating() {
+		g.stableGenerations++
+	} else {
+		g.stableGenerations = 0
+	}
+	
+	// Trigger randomization if stale
+	if g.isStale() {
+		g.RandomSeed(0.3)
+		g.resetStalenessCounters()
+	}
+	
+	g.lastChangedCells = changedCells
+}
+
+// isOscillating checks if current state matches any previous state in history
+func (g *Grid) isOscillating() bool {
+	for i := 0; i < g.historySize; i++ {
+		if i == g.historyIndex {
+			continue // Skip current slot
+		}
+		if g.statesEqual(g.Cells, g.stateHistory[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// statesEqual compares two grid states for equality
+func (g *Grid) statesEqual(state1, state2 [GridSize][GridSize]Cell) bool {
+	for x := 0; x < GridSize; x++ {
+		for y := 0; y < GridSize; y++ {
+			if state1[x][y] != state2[x][y] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isStale determines if the grid should be randomized based on multiple criteria
+func (g *Grid) isStale() bool {
+	// Stale if low activity for too long
+	if g.lowActivityGenerations >= 75 { // 75 generations of minimal change
+		return true
+	}
+	
+	// Stale if oscillating for too long
+	if g.stableGenerations >= g.oscillationThreshold {
+		return true
+	}
+	
+	return false
+}
+
+// resetStalenessCounters resets all staleness detection counters
+func (g *Grid) resetStalenessCounters() {
+	g.emptyGenerations = 0
+	g.lowActivityGenerations = 0
+	g.stableGenerations = 0
+	g.lastChangedCells = 0
+	g.historyIndex = 0
+	// Clear state history
+	for i := range g.stateHistory {
+		g.stateHistory[i] = [GridSize][GridSize]Cell{}
+	}
+}
+
+// GetStalenessInfo returns current staleness detection state for debugging/monitoring
+func (g *Grid) GetStalenessInfo() map[string]int {
+	return map[string]int{
+		"emptyGenerations":      g.emptyGenerations,
+		"lowActivityGenerations": g.lowActivityGenerations,
+		"stableGenerations":     g.stableGenerations,
+		"lastChangedCells":      g.lastChangedCells,
+		"generation":           g.Generation,
 	}
 }
