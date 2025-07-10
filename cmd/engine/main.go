@@ -188,14 +188,16 @@ func (e *Engine) executeStep() {
 	}
 	
 	// 2. Get halo data from controller
-	_, err = e.getHalo()
+	haloData, err := e.getHalo()
 	if err != nil {
 		log.Printf("Failed to get halo: %v", err)
 		return
 	}
 	
-	// 3. Apply halo to grid (TODO: implement halo application)
-	// For now, just compute next generation normally
+	// 3. Apply halo data to grid for border cell computation
+	e.applyHaloToGrid(haloData)
+	
+	// 4. Compute next generation with neighbor data
 	e.grid.ComputeNextGeneration()
 	e.grid.CommitNextGeneration()
 	
@@ -206,6 +208,55 @@ func (e *Engine) executeStep() {
 	e.pushState()
 	
 	log.Printf("Engine %s completed step for generation %d", e.nodeID, controllerGen)
+}
+
+// applyHaloToGrid extracts directional edges from 9x9 halo and applies them to the grid
+func (e *Engine) applyHaloToGrid(halo [9][9]bool) {
+	// Enable crosstalk by setting dummy neighbors (actual neighbors handled by controller)
+	e.grid.SetNeighbors(map[string]string{
+		"north": "controller",
+		"south": "controller", 
+		"east": "controller",
+		"west": "controller",
+	})
+	
+	// Extract directional edges from 9x9 halo:
+	// - Row 0: North neighbors  
+	// - Row 8: South neighbors
+	// - Col 0: West neighbors
+	// - Col 8: East neighbors
+	
+	// North edge (top row of halo, cols 1-7 map to our grid cols 0-6)
+	northData := make([]bool, 7)
+	for i := 0; i < 7; i++ {
+		northData[i] = halo[0][i+1]
+	}
+	e.grid.UpdateHaloRegion("north", northData)
+	log.Printf("DEBUG: Engine %s set north halo: %v", e.nodeID, northData)
+	
+	// South edge (bottom row of halo, cols 1-7 map to our grid cols 0-6)  
+	southData := make([]bool, 7)
+	for i := 0; i < 7; i++ {
+		southData[i] = halo[8][i+1]
+	}
+	e.grid.UpdateHaloRegion("south", southData)
+	
+	// West edge (left column of halo, rows 1-7 map to our grid rows 0-6)
+	westData := make([]bool, 7)
+	for i := 0; i < 7; i++ {
+		westData[i] = halo[i+1][0]
+	}
+	e.grid.UpdateHaloRegion("west", westData)
+	
+	// East edge (right column of halo, rows 1-7 map to our grid rows 0-6)
+	eastData := make([]bool, 7)
+	for i := 0; i < 7; i++ {
+		eastData[i] = halo[i+1][8]
+	}
+	e.grid.UpdateHaloRegion("east", eastData)
+	log.Printf("DEBUG: Engine %s set east halo: %v", e.nodeID, eastData)
+	
+	log.Printf("Applied halo data to grid - crosstalk enabled")
 }
 
 // getHalo fetches surrounding cells from controller

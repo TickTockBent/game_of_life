@@ -1,6 +1,7 @@
 package gameoflife
 
 import (
+	"log"
 	"math/rand"
 )
 
@@ -110,8 +111,8 @@ func (g *Grid) countNeighbors(x, y int) int {
 				if g.Cells[nx][ny] {
 					count++
 				}
-			} else if g.crosstalkEnabled {
-				// Check halo regions for out-of-bounds neighbors
+			} else {
+				// Always check halo regions for out-of-bounds neighbors
 				if g.checkHaloNeighbor(nx, ny) {
 					count++
 				}
@@ -128,19 +129,39 @@ func (g *Grid) checkHaloNeighbor(x, y int) bool {
 	
 	// North halo (x = -1)
 	if x == -1 && y >= 0 && y < GridSize && g.haloNorth != nil {
-		return g.haloNorth[y]
+		result := g.haloNorth[y]
+		// Log only first few calls to avoid spam
+		if g.Generation < 30 {
+			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - north halo[%d] = %v", x, y, y, result)
+		}
+		return result
 	}
 	// South halo (x = GridSize)
 	if x == GridSize && y >= 0 && y < GridSize && g.haloSouth != nil {
-		return g.haloSouth[y]
+		result := g.haloSouth[y]
+		if g.Generation < 30 {
+			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - south halo[%d] = %v", x, y, y, result)
+		}
+		return result
 	}
 	// West halo (y = -1)
 	if y == -1 && x >= 0 && x < GridSize && g.haloWest != nil {
-		return g.haloWest[x]
+		result := g.haloWest[x]
+		if g.Generation < 30 {
+			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - west halo[%d] = %v", x, y, x, result)
+		}
+		return result
 	}
 	// East halo (y = GridSize)
 	if y == GridSize && x >= 0 && x < GridSize && g.haloEast != nil {
-		return g.haloEast[x]
+		result := g.haloEast[x]
+		if g.Generation < 30 {
+			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - east halo[%d] = %v", x, y, x, result)
+		}
+		return result
+	}
+	if g.Generation < 30 {
+		log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - no halo match, returning false", x, y)
 	}
 	return false
 }

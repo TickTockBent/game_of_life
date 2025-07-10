@@ -22,10 +22,10 @@ class GameOfLifeVisualizer {
             this.updateTimingDisplay();
         }, 1000);
         
-        // Update metrics every 2 seconds (still use polling for metrics)
+        // Update metrics every 500ms for real-time queue monitoring
         setInterval(() => {
             this.updateMetrics();
-        }, 2000);
+        }, 500);
     }
     
     setupEventListeners() {
@@ -486,7 +486,7 @@ class GameOfLifeVisualizer {
     
     async updateMetrics() {
         try {
-            const response = await fetch('/metrics', {
+            const response = await fetch('/api/metrics', {
                 signal: AbortSignal.timeout(3000) // 3 second timeout for metrics
             });
             
@@ -499,9 +499,10 @@ class GameOfLifeVisualizer {
                 throw new Error(`HTTP ${response.status}`);
             }
             
-            const metrics = await response.json();
+            const data = await response.json();
             
-            if (metrics) {
+            if (data && data.controller) {
+                const metrics = data.controller;
                 // Current generation from controller
                 if (metrics.generation !== undefined) {
                     document.getElementById('controllerLoad').textContent = `Gen ${metrics.generation}`;
@@ -525,38 +526,38 @@ class GameOfLifeVisualizer {
                     document.getElementById('lastStep').textContent = `${age}s ago`;
                 }
                 
-                // Router queue metrics (multiple queues)
-                const totalQueueSize = metrics.totalQueueSize || 
-                                     (metrics.regQueueSize || 0) + 
-                                     (metrics.batchQueueSize || 0) + 
-                                     (metrics.webQueueSize || 0) + 
-                                     (metrics.haloQueueSize || 0);
+                // Queue metrics
+                const totalQueueSize = metrics.totalQueueSize || 0;
                 
-                if (totalQueueSize !== undefined) {
-                    const queueEl = document.getElementById('queueSize');
-                    if (queueEl) {
-                        // Show breakdown of queue sizes
-                        const breakdown = [];
-                        if (metrics.regQueueSize > 0) breakdown.push(`R:${metrics.regQueueSize}`);
-                        if (metrics.batchQueueSize > 0) breakdown.push(`S:${metrics.batchQueueSize}`);
-                        if (metrics.webQueueSize > 0) breakdown.push(`W:${metrics.webQueueSize}`);
-                        if (metrics.haloQueueSize > 0) breakdown.push(`H:${metrics.haloQueueSize}`);
-                        
-                        if (breakdown.length > 0) {
-                            queueEl.textContent = `${totalQueueSize} (${breakdown.join(', ')})`;
-                        } else {
-                            queueEl.textContent = totalQueueSize;
-                        }
-                        
-                        // Color-code based on total queue size
-                        if (totalQueueSize > 500) {
-                            queueEl.style.color = 'red';
-                        } else if (totalQueueSize > 100) {
-                            queueEl.style.color = 'orange';
-                        } else {
-                            queueEl.style.color = 'green';
-                        }
+                // Update total queue size
+                const queueEl = document.getElementById('queueSize');
+                if (queueEl) {
+                    queueEl.textContent = totalQueueSize;
+                    // Color-code based on total queue size
+                    if (totalQueueSize > 500) {
+                        queueEl.style.color = 'red';
+                    } else if (totalQueueSize > 100) {
+                        queueEl.style.color = 'orange';
+                    } else {
+                        queueEl.style.color = 'green';
                     }
+                }
+                
+                // Update individual queue sizes
+                if (metrics.regQueueSize !== undefined) {
+                    document.getElementById('registerQueue').textContent = metrics.regQueueSize || 0;
+                }
+                if (metrics.stateQueueSize !== undefined) {
+                    document.getElementById('stateQueue').textContent = metrics.stateQueueSize || 0;
+                }
+                if (metrics.haloQueueSize !== undefined) {
+                    document.getElementById('haloQueue').textContent = metrics.haloQueueSize || 0;
+                }
+                if (metrics.webQueueSize !== undefined) {
+                    document.getElementById('webQueue').textContent = Math.max(0, metrics.webQueueSize);
+                }
+                if (metrics.stepQueueSize !== undefined) {
+                    document.getElementById('stepQueue').textContent = metrics.stepQueueSize || 0;
                 }
             }
         } catch (error) {
