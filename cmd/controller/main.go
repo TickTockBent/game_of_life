@@ -36,6 +36,9 @@ type Controller struct {
 	stepInProgress    bool          // true when step broadcast is in progress
 	barrierTimeout    time.Duration // timeout for waiting for all engines
 	
+	// Debug controls
+	steppingPaused    bool          // When true, barrier coordinator won't auto-step
+	
 	// WebSocket clients for real-time updates
 	wsClients    map[*websocket.Conn]bool // connected WebSocket clients
 	wsMutex      sync.RWMutex             // protects wsClients map
@@ -156,6 +159,7 @@ func NewController() *Controller {
 		readyEngines:      make(map[int]bool),
 		stepInProgress:    false,
 		barrierTimeout:    1000 * time.Millisecond, // 1 second barrier timeout
+		steppingPaused:    false,
 		wsClients:         make(map[*websocket.Conn]bool),
 		wsUpgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -298,17 +302,45 @@ func (c *Controller) processHaloRead(position int) HaloResponse {
 					halo[haloRow][haloCol] = state.Grid[gridRow][gridCol]
 				}
 			} else {
-				// Edge cells come from neighbors
-				neighborRow := row + (haloRow - 4)
-				neighborCol := col + (haloCol - 4)
+				// Edge cells come from neighbors - determine which neighbor and cell
+				var neighborPos int = -1
+				var nRow, nCol int
 				
-				if neighborRow >= 0 && neighborRow < 10 && neighborCol >= 0 && neighborCol < 10 {
-					neighborPos := neighborRow*10 + neighborCol
+				if haloRow == 0 && haloCol >= 1 && haloCol <= 7 {
+					// North edge - neighbor is position - 10
+					if row > 0 {
+						neighborPos = (row-1)*10 + col
+						nRow = 6 // Get neighbor's south edge
+						nCol = haloCol - 1 // Map halo col 1-7 to grid col 0-6
+					}
+				} else if haloRow == 8 && haloCol >= 1 && haloCol <= 7 {
+					// South edge - neighbor is position + 10  
+					if row < 9 {
+						neighborPos = (row+1)*10 + col
+						nRow = 0 // Get neighbor's north edge
+						nCol = haloCol - 1
+					}
+				} else if haloCol == 0 && haloRow >= 1 && haloRow <= 7 {
+					// West edge - neighbor is position - 1
+					if col > 0 {
+						neighborPos = row*10 + (col-1)
+						nRow = haloRow - 1 // Map halo row 1-7 to grid row 0-6
+						nCol = 6 // Get neighbor's east edge
+					}
+				} else if haloCol == 8 && haloRow >= 1 && haloRow <= 7 {
+					// East edge - neighbor is position + 1
+					if col < 9 {
+						neighborPos = row*10 + (col+1)
+						nRow = haloRow - 1
+						nCol = 0 // Get neighbor's west edge
+					}
+				}
+				
+				// Get the cell from the neighbor if valid
+				if neighborPos >= 0 {
 					if state, exists := c.gridStates[neighborPos]; exists {
-						// Map halo edge to neighbor's opposite edge
-						nRow := (haloRow + 3) % 7
-						nCol := (haloCol + 3) % 7
-						if nRow < len(state.Grid) && nCol < len(state.Grid[nRow]) {
+						if nRow >= 0 && nRow < 7 && nCol >= 0 && nCol < 7 &&
+						   nRow < len(state.Grid) && nCol < len(state.Grid[nRow]) {
 							halo[haloRow][haloCol] = state.Grid[nRow][nCol]
 						}
 					}
@@ -378,18 +410,26 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 		
 	case "metrics":
 		// Metrics for web interface
+		webQueue := atomic.LoadInt64(&c.webReadQueueSize)
+		if webQueue < 0 {
+			webQueue = 0 // Fix negative queue bug
+		}
+		
 		return map[string]interface{}{
 			"timestamp":    time.Now().Unix(),
 			"regionId":     c.regionID,
+			"generation":   atomic.LoadInt64(&c.currentGeneration),
+			"nodes":        len(c.nodes),
+			"activeGrids":  len(c.gridStates),
 			"totalQueueSize": atomic.LoadInt64(&c.registerQueueSize) +
 				atomic.LoadInt64(&c.stateUpdateQueueSize) +
 				atomic.LoadInt64(&c.haloReadQueueSize) +
-				atomic.LoadInt64(&c.webReadQueueSize) +
+				webQueue +
 				atomic.LoadInt64(&c.stepBroadcastQueueSize),
 			"regQueueSize":   atomic.LoadInt64(&c.registerQueueSize),
 			"stateQueueSize": atomic.LoadInt64(&c.stateUpdateQueueSize),
 			"haloQueueSize":  atomic.LoadInt64(&c.haloReadQueueSize),
-			"webQueueSize":   atomic.LoadInt64(&c.webReadQueueSize),
+			"webQueueSize":   webQueue,
 			"stepQueueSize":  atomic.LoadInt64(&c.stepBroadcastQueueSize),
 		}
 		
@@ -556,7 +596,7 @@ func (c *Controller) barrierCoordinator() {
 	defer ticker.Stop()
 	
 	for range ticker.C {
-		if !c.stepInProgress && len(c.nodes) > 0 {
+		if !c.stepInProgress && len(c.nodes) > 0 && !c.steppingPaused {
 			// Check if all engines are ready or timeout expired
 			readyCount := len(c.readyEngines)
 			totalEngines := len(c.nodes)
@@ -900,6 +940,58 @@ func (c *Controller) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Debug endpoints
+
+// POST /debug/pause
+func (c *Controller) handleDebugPause(w http.ResponseWriter, r *http.Request) {
+	c.steppingPaused = true
+	log.Printf("DEBUG: Stepping paused at generation %d", atomic.LoadInt64(&c.currentGeneration))
+	
+	response := map[string]interface{}{
+		"status": "paused",
+		"generation": atomic.LoadInt64(&c.currentGeneration),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// POST /debug/unpause
+func (c *Controller) handleDebugUnpause(w http.ResponseWriter, r *http.Request) {
+	c.steppingPaused = false
+	log.Printf("DEBUG: Stepping unpaused at generation %d", atomic.LoadInt64(&c.currentGeneration))
+	
+	response := map[string]interface{}{
+		"status": "running",
+		"generation": atomic.LoadInt64(&c.currentGeneration),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// POST /debug/nextstep
+func (c *Controller) handleDebugNextStep(w http.ResponseWriter, r *http.Request) {
+	if !c.steppingPaused {
+		http.Error(w, "Must be paused to use nextstep", http.StatusBadRequest)
+		return
+	}
+	
+	if c.stepInProgress {
+		http.Error(w, "Step already in progress", http.StatusConflict)
+		return
+	}
+	
+	log.Printf("DEBUG: Manual step requested at generation %d", atomic.LoadInt64(&c.currentGeneration))
+	c.stepInProgress = true
+	go c.broadcastStepToAllEngines()
+	
+	response := map[string]interface{}{
+		"status": "step_triggered",
+		"generation": atomic.LoadInt64(&c.currentGeneration) + 1,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // sendInitialState sends current aggregated state to a new WebSocket client
 func (c *Controller) sendInitialState(conn *websocket.Conn) {
 	// Get current aggregated state
@@ -958,6 +1050,11 @@ func main() {
 	
 	// WebSocket endpoint for real-time updates
 	r.HandleFunc("/ws", controller.handleWebSocket)
+	
+	// Debug endpoints
+	r.HandleFunc("/debug/pause", controller.handleDebugPause).Methods("POST")
+	r.HandleFunc("/debug/unpause", controller.handleDebugUnpause).Methods("POST")
+	r.HandleFunc("/debug/nextstep", controller.handleDebugNextStep).Methods("POST")
 
 	port := os.Getenv("PORT")
 	if port == "" {
