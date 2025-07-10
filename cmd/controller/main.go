@@ -7,35 +7,79 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
 )
 
-// Simple controller for star topology - just aggregates state and serves halo data
+// Controller with channel-based message handling and zero locks
 type Controller struct {
-	// Node registry
-	nodes      map[int]*NodeInfo
-	nodesMu    sync.RWMutex
+	// Message channels for different request types
+	registerChan    chan *RegisterMessage
+	stateUpdateChan chan *StateUpdateMessage
+	haloReadChan    chan *HaloReadMessage
+	webReadChan     chan *WebReadMessage
+	clickChan       chan *ClickMessage
+	stepBroadcastChan chan *StepBroadcastMessage
 	
-	// Grid state storage
-	gridStates map[int]*GridState
-	stateMu    sync.RWMutex
-	
-	// Generation counter for lazy sync
+	// State (only accessed by the main goroutine)
+	nodes             map[int]*NodeInfo
+	gridStates        map[int]*GridState
 	currentGeneration int64
-	generationMu      sync.RWMutex
+	regionID          string
 	
-	// Simple metrics
-	regionID   string
+	// Barrier sync state
+	readyEngines      map[int]bool  // tracks which engines are ready for current generation
+	stepInProgress    bool          // true when step broadcast is in progress
+	barrierTimeout    time.Duration // timeout for waiting for all engines
+	
+	// Metrics (atomic counters)
+	registerQueueSize    int64
+	stateUpdateQueueSize int64
+	haloReadQueueSize    int64
+	webReadQueueSize     int64
+	stepBroadcastQueueSize int64
 }
 
+// Message types for channels
+type RegisterMessage struct {
+	Request  RegisterRequest
+	Response chan RegisterResponse
+}
+
+type StateUpdateMessage struct {
+	Position int
+	Request  StateUpdateRequest
+	Response chan error
+}
+
+type HaloReadMessage struct {
+	Position int
+	Response chan HaloResponse
+}
+
+type WebReadMessage struct {
+	Type     string // "generation", "aggregated-state", "topology", "health"
+	Response chan interface{}
+}
+
+type ClickMessage struct {
+	Request  ClickRequest
+	Response chan error
+}
+
+type StepBroadcastMessage struct {
+	Position int
+	Response chan error
+}
+
+// Data types
 type NodeInfo struct {
-	PodID        string    `json:"podId"`
-	Position     Position  `json:"position"`
-	Endpoint     string    `json:"endpoint"`
-	RegisteredAt time.Time `json:"registeredAt"`
+	PodID         string    `json:"podId"`
+	Position      Position  `json:"position"`
+	Endpoint      string    `json:"endpoint"`
+	RegisteredAt  time.Time `json:"registeredAt"`
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
 }
 
@@ -50,7 +94,6 @@ type GridState struct {
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
-// Request/Response types
 type RegisterRequest struct {
 	PodID    string `json:"podId"`
 	Endpoint string `json:"endpoint"`
@@ -63,6 +106,12 @@ type RegisterResponse struct {
 type StateUpdateRequest struct {
 	Grid       [][]bool `json:"grid"`
 	Generation int      `json:"generation"`
+}
+
+type ClickRequest struct {
+	GlobalX int  `json:"globalX"`
+	GlobalY int  `json:"globalY"`
+	Alive   bool `json:"alive"`
 }
 
 type TopologyResponse struct {
@@ -86,14 +135,26 @@ func NewController() *Controller {
 	}
 
 	c := &Controller{
+		registerChan:      make(chan *RegisterMessage, 200),
+		stateUpdateChan:   make(chan *StateUpdateMessage, 2000),
+		haloReadChan:      make(chan *HaloReadMessage, 1000),
+		webReadChan:       make(chan *WebReadMessage, 1000),
+		clickChan:         make(chan *ClickMessage, 100),
+		stepBroadcastChan: make(chan *StepBroadcastMessage, 1000),
 		nodes:             make(map[int]*NodeInfo),
 		gridStates:        make(map[int]*GridState),
 		currentGeneration: 0,
 		regionID:          regionID,
+		readyEngines:      make(map[int]bool),
+		stepInProgress:    false,
+		barrierTimeout:    1000 * time.Millisecond, // 1 second barrier timeout
 	}
 	
-	// Start generation advancement timer
-	go c.generationAdvancer()
+	// Start the main message processor
+	go c.messageProcessor()
+	
+	// Start barrier coordinator
+	go c.barrierCoordinator()
 	
 	// Start health check timer
 	go c.healthChecker()
@@ -101,98 +162,55 @@ func NewController() *Controller {
 	return c
 }
 
-// generationAdvancer increments the global generation counter every 200ms
-func (c *Controller) generationAdvancer() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		c.generationMu.Lock()
-		c.currentGeneration++
-		c.generationMu.Unlock()
-	}
-}
-
-// healthChecker removes stale nodes that haven't sent heartbeats
-func (c *Controller) healthChecker() {
-	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		now := time.Now()
-		staleThreshold := 2 * time.Minute // Consider stale after 2 minutes
-		
-		c.nodesMu.Lock()
-		stalePods := []int{}
-		for pos, node := range c.nodes {
-			if now.Sub(node.LastHeartbeat) > staleThreshold {
-				stalePods = append(stalePods, pos)
-				log.Printf("Removing stale node %s at position %d (last heartbeat: %v ago)",
-					node.PodID, pos, now.Sub(node.LastHeartbeat))
-			}
-		}
-		
-		// Remove stale nodes and clean up their resources
-		for _, pos := range stalePods {
-			delete(c.nodes, pos)
-		}
-		c.nodesMu.Unlock()
-		
-		// Clean up grid states separately to avoid nested locks
-		if len(stalePods) > 0 {
-			c.stateMu.Lock()
-			for _, pos := range stalePods {
-				delete(c.gridStates, pos)
-			}
-			c.stateMu.Unlock()
-		}
-		
-		if len(stalePods) > 0 {
-			log.Printf("Health check removed %d stale nodes", len(stalePods))
+// Main message processing loop - all state mutations happen here
+func (c *Controller) messageProcessor() {
+	for {
+		select {
+		case msg := <-c.registerChan:
+			atomic.AddInt64(&c.registerQueueSize, -1)
+			response := c.processRegister(msg.Request)
+			msg.Response <- response
+			
+		case msg := <-c.stateUpdateChan:
+			atomic.AddInt64(&c.stateUpdateQueueSize, -1)
+			err := c.processStateUpdate(msg.Position, msg.Request)
+			msg.Response <- err
+			
+		case msg := <-c.haloReadChan:
+			atomic.AddInt64(&c.haloReadQueueSize, -1)
+			response := c.processHaloRead(msg.Position)
+			msg.Response <- response
+			
+		case msg := <-c.webReadChan:
+			atomic.AddInt64(&c.webReadQueueSize, -1)
+			response := c.processWebRead(msg.Type)
+			msg.Response <- response
+			
+		case msg := <-c.clickChan:
+			err := c.processClick(msg.Request)
+			msg.Response <- err
+			
+		case msg := <-c.stepBroadcastChan:
+			atomic.AddInt64(&c.stepBroadcastQueueSize, -1)
+			err := c.processStepBroadcast(msg.Position)
+			msg.Response <- err
 		}
 	}
 }
 
-// GET /generation - Return current generation for engines to sync against
-func (c *Controller) handleGeneration(w http.ResponseWriter, r *http.Request) {
-	c.generationMu.RLock()
-	gen := c.currentGeneration
-	c.generationMu.RUnlock()
-	
-	response := map[string]interface{}{
-		"generation": gen,
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// POST /register - Assign position to new engine
-func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	c.nodesMu.Lock()
-	
+// Process register request
+func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 	// Check if this pod is already registered
 	for pos, node := range c.nodes {
 		if node.PodID == req.PodID {
 			// Update heartbeat for existing registration
 			node.LastHeartbeat = time.Now()
-			c.nodesMu.Unlock()
-			
-			response := RegisterResponse{Position: pos}
 			log.Printf("Re-registered existing node %s at position %d", req.PodID, pos)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
-			return
+			return RegisterResponse{Position: pos}
 		}
 	}
 	
-	// Find first available position (reuse positions from removed nodes)
+	// Find first available position
 	position := -1
 	for i := 0; i < 100; i++ {
 		if _, exists := c.nodes[i]; !exists {
@@ -202,9 +220,7 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	if position == -1 {
-		c.nodesMu.Unlock()
-		http.Error(w, "Grid full", http.StatusServiceUnavailable)
-		return
+		return RegisterResponse{Position: -1} // Will handle error in handler
 	}
 	
 	// Convert position to row/col (10x10 grid layout)
@@ -213,72 +229,48 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	
 	now := time.Now()
 	c.nodes[position] = &NodeInfo{
-		PodID:        req.PodID,
-		Position:     Position{Row: row, Col: col},
-		Endpoint:     req.Endpoint,
-		RegisteredAt: now,
+		PodID:         req.PodID,
+		Position:      Position{Row: row, Col: col},
+		Endpoint:      req.Endpoint,
+		RegisteredAt:  now,
 		LastHeartbeat: now,
 	}
-	c.nodesMu.Unlock()
-
-	response := RegisterResponse{Position: position}
+	
 	log.Printf("Registered node %s at position %d", req.PodID, position)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	return RegisterResponse{Position: position}
 }
 
-// POST /state/{position} - Store grid state from engine
-func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-
-	var req StateUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
+// Process state update
+func (c *Controller) processStateUpdate(position int, req StateUpdateRequest) error {
 	// Update grid state
-	c.stateMu.Lock()
 	c.gridStates[position] = &GridState{
 		Grid:       req.Grid,
 		Generation: req.Generation,
 		UpdatedAt:  time.Now(),
 	}
-	c.stateMu.Unlock()
 	
 	// Update heartbeat for this node
-	c.nodesMu.Lock()
 	if node, exists := c.nodes[position]; exists {
 		node.LastHeartbeat = time.Now()
 	}
-	c.nodesMu.Unlock()
-
-	w.WriteHeader(http.StatusOK)
+	
+	// Mark engine as ready for current generation (state post = readiness signal)
+	if req.Generation == int(c.currentGeneration) {
+		c.readyEngines[position] = true
+		log.Printf("Engine %d ready for generation %d (%d/%d ready)", 
+			position, c.currentGeneration, len(c.readyEngines), len(c.nodes))
+	}
+	
+	return nil
 }
 
-// GET /halo/{position} - Return 9x9 region around position for edge computation
-func (c *Controller) handleHaloRequest(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-
+// Process halo read request
+func (c *Controller) processHaloRead(position int) HaloResponse {
 	// Calculate grid coordinates (10x10 layout)
 	row := position / 10
 	col := position % 10
 
 	var halo [9][9]bool
-
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
 
 	// Build 9x9 halo with this position's 7x7 in center
 	for haloRow := 0; haloRow < 9; haloRow++ {
@@ -311,93 +303,465 @@ func (c *Controller) handleHaloRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response := HaloResponse{HaloCells: halo}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	return HaloResponse{HaloCells: halo}
 }
 
-// GET /aggregated-state - Return all grid states for web interface
-func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Request) {
-	c.nodesMu.RLock()
-	nodes := make(map[int]*NodeInfo)
-	for k, v := range c.nodes {
-		nodes[k] = v
-	}
-	c.nodesMu.RUnlock()
+// Process web read requests
+func (c *Controller) processWebRead(requestType string) interface{} {
+	switch requestType {
+	case "generation":
+		return map[string]interface{}{
+			"generation": atomic.LoadInt64(&c.currentGeneration),
+		}
+		
+	case "aggregated-state":
+		// Copy node data
+		nodes := make(map[int]*NodeInfo)
+		for k, v := range c.nodes {
+			nodes[k] = v
+		}
 
-	c.stateMu.RLock()
-	grids := make(map[string]*GridState)
-	for position, state := range c.gridStates {
-		grids[strconv.Itoa(position)] = state
-	}
-	c.stateMu.RUnlock()
+		// Copy grid state data
+		grids := make(map[string]*GridState)
+		for position, state := range c.gridStates {
+			grids[strconv.Itoa(position)] = state
+		}
 
-	response := &AggregatedStateResponse{
-		Topology: &TopologyResponse{
+		return &AggregatedStateResponse{
+			Topology: &TopologyResponse{
+				RegionID: c.regionID,
+				Nodes:    nodes,
+			},
+			Grids: grids,
+		}
+		
+	case "topology":
+		nodes := make(map[int]*NodeInfo)
+		for k, v := range c.nodes {
+			nodes[k] = v
+		}
+
+		return TopologyResponse{
 			RegionID: c.regionID,
 			Nodes:    nodes,
-		},
-		Grids: grids,
+		}
+		
+	case "health":
+		return map[string]interface{}{
+			"status":      "healthy",
+			"regionId":    c.regionID,
+			"nodes":       len(c.nodes),
+			"activeGrids": len(c.gridStates),
+			"generation":  atomic.LoadInt64(&c.currentGeneration),
+			"queues": map[string]int64{
+				"register":      atomic.LoadInt64(&c.registerQueueSize),
+				"stateUpdate":   atomic.LoadInt64(&c.stateUpdateQueueSize),
+				"haloRead":      atomic.LoadInt64(&c.haloReadQueueSize),
+				"webRead":       atomic.LoadInt64(&c.webReadQueueSize),
+				"stepBroadcast": atomic.LoadInt64(&c.stepBroadcastQueueSize),
+			},
+		}
+		
+	case "metrics":
+		// Metrics for web interface
+		return map[string]interface{}{
+			"timestamp":    time.Now().Unix(),
+			"regionId":     c.regionID,
+			"totalQueueSize": atomic.LoadInt64(&c.registerQueueSize) +
+				atomic.LoadInt64(&c.stateUpdateQueueSize) +
+				atomic.LoadInt64(&c.haloReadQueueSize) +
+				atomic.LoadInt64(&c.webReadQueueSize) +
+				atomic.LoadInt64(&c.stepBroadcastQueueSize),
+			"regQueueSize":   atomic.LoadInt64(&c.registerQueueSize),
+			"stateQueueSize": atomic.LoadInt64(&c.stateUpdateQueueSize),
+			"haloQueueSize":  atomic.LoadInt64(&c.haloReadQueueSize),
+			"webQueueSize":   atomic.LoadInt64(&c.webReadQueueSize),
+			"stepQueueSize":  atomic.LoadInt64(&c.stepBroadcastQueueSize),
+		}
+		
+	default:
+		return nil
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
-// GET /topology - Return node positions
+// Process click request
+func (c *Controller) processClick(req ClickRequest) error {
+	// Calculate which grid this click belongs to (7x7 grids)
+	gridX := req.GlobalX / 7
+	gridY := req.GlobalY / 7
+	position := gridY*10 + gridX
+	
+	// Check if we have this grid
+	if _, exists := c.gridStates[position]; exists {
+		log.Printf("Click at (%d,%d) targeting grid at position %d", req.GlobalX, req.GlobalY, position)
+		return nil
+	}
+	
+	return fmt.Errorf("grid not found")
+}
+
+// broadcastStepToAllEngines sends step signal to all registered engines
+func (c *Controller) broadcastStepToAllEngines() {
+	// Advance generation first
+	atomic.AddInt64(&c.currentGeneration, 1)
+	newGeneration := atomic.LoadInt64(&c.currentGeneration)
+	
+	log.Printf("Broadcasting step signal for generation %d to %d engines", newGeneration, len(c.nodes))
+	
+	// Send step signal to all engines via HTTP
+	for position := range c.nodes {
+		go c.sendStepSignalToEngine(position)
+	}
+	
+	// Reset readiness tracking for next generation
+	c.readyEngines = make(map[int]bool)
+	c.stepInProgress = false
+}
+
+// sendStepSignalToEngine sends step signal to a specific engine
+func (c *Controller) sendStepSignalToEngine(position int) {
+	node, exists := c.nodes[position]
+	if !exists {
+		return
+	}
+	
+	// Create HTTP client for step signal
+	client := &http.Client{Timeout: 2 * time.Second}
+	
+	// Send step signal to engine
+	url := fmt.Sprintf("%s/step", node.Endpoint)
+	resp, err := client.Post(url, "application/json", nil)
+	if err != nil {
+		log.Printf("Failed to send step signal to engine %d: %v", position, err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		log.Printf("Engine %d rejected step signal: %d", position, resp.StatusCode)
+	}
+}
+
+// processStepBroadcast handles step broadcast requests (if needed)
+func (c *Controller) processStepBroadcast(position int) error {
+	// This can be used for engine-initiated step requests if needed
+	return nil
+}
+
+// barrierCoordinator manages the barrier synchronization for distributed stepping
+func (c *Controller) barrierCoordinator() {
+	ticker := time.NewTicker(c.barrierTimeout)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		if !c.stepInProgress && len(c.nodes) > 0 {
+			// Check if all engines are ready or timeout expired
+			readyCount := len(c.readyEngines)
+			totalEngines := len(c.nodes)
+			
+			if readyCount >= totalEngines || true { // Always step after timeout
+				log.Printf("Barrier sync: %d/%d engines ready, broadcasting step for generation %d", 
+					readyCount, totalEngines, c.currentGeneration)
+				
+				c.stepInProgress = true
+				go c.broadcastStepToAllEngines()
+			}
+		}
+	}
+}
+
+// healthChecker sends periodic health check messages
+func (c *Controller) healthChecker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// Send a health check message to clean up stale nodes
+		responseChan := make(chan interface{}, 1)
+		select {
+		case c.webReadChan <- &WebReadMessage{Type: "health-check", Response: responseChan}:
+			// Message queued successfully
+		default:
+			// Queue full, skip this health check
+		}
+	}
+}
+
+// HTTP Handlers - these just queue messages and wait for responses
+
+// POST /register
+func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	responseChan := make(chan RegisterResponse, 1)
+	msg := &RegisterMessage{
+		Request:  req,
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.registerChan <- msg:
+		atomic.AddInt64(&c.registerQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		if response.Position == -1 {
+			http.Error(w, "Grid full", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// POST /state/{position}
+func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	position, err := strconv.Atoi(vars["position"])
+	if err != nil {
+		http.Error(w, "Invalid position", http.StatusBadRequest)
+		return
+	}
+
+	var req StateUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	responseChan := make(chan error, 1)
+	msg := &StateUpdateMessage{
+		Position: position,
+		Request:  req,
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.stateUpdateChan <- msg:
+		atomic.AddInt64(&c.stateUpdateQueueSize, 1)
+		// Wait for response
+		if err := <-responseChan; err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// GET /halo/{position}
+func (c *Controller) handleHaloRequest(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	position, err := strconv.Atoi(vars["position"])
+	if err != nil {
+		http.Error(w, "Invalid position", http.StatusBadRequest)
+		return
+	}
+
+	responseChan := make(chan HaloResponse, 1)
+	msg := &HaloReadMessage{
+		Position: position,
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.haloReadChan <- msg:
+		atomic.AddInt64(&c.haloReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// GET /generation
+func (c *Controller) handleGeneration(w http.ResponseWriter, r *http.Request) {
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "generation",
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// GET /aggregated-state
+func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Request) {
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "aggregated-state",
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// GET /topology
 func (c *Controller) handleTopology(w http.ResponseWriter, r *http.Request) {
-	c.nodesMu.RLock()
-	nodes := make(map[int]*NodeInfo)
-	for k, v := range c.nodes {
-		nodes[k] = v
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "topology",
+		Response: responseChan,
 	}
-	c.nodesMu.RUnlock()
-
-	response := TopologyResponse{
-		RegionID: c.regionID,
-		Nodes:    nodes,
+	
+	// Try to queue the message
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
-// GET /metrics - Simple system metrics
-func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	c.nodesMu.RLock()
-	nodeCount := len(c.nodes)
-	c.nodesMu.RUnlock()
-
-	c.stateMu.RLock()
-	stateCount := len(c.gridStates)
-	c.stateMu.RUnlock()
-
-	c.generationMu.RLock()
-	currentGen := c.currentGeneration
-	c.generationMu.RUnlock()
-
-	metrics := map[string]interface{}{
-		"timestamp":    time.Now().Unix(),
-		"regionId":     c.regionID,
-		"nodes":        nodeCount,
-		"activeGrids":  stateCount,
-		"generation":   currentGen,
+// POST /api/click
+func (c *Controller) handleClick(w http.ResponseWriter, r *http.Request) {
+	var req ClickRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+	
+	responseChan := make(chan error, 1)
+	msg := &ClickMessage{
+		Request:  req,
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.clickChan <- msg:
+		// Wait for response
+		if err := <-responseChan; err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
 }
 
-// GET /health - Health check
+// POST /api/randomize
+func (c *Controller) handleRandomize(w http.ResponseWriter, r *http.Request) {
+	// For now, just use the web read channel to get node count
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "health",
+		Response: responseChan,
+	}
+	
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		if health, ok := <-responseChan; ok {
+			if healthMap, ok := health.(map[string]interface{}); ok {
+				total := healthMap["nodes"].(int)
+				response := map[string]interface{}{
+					"success": total,
+					"total":   total,
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(response)
+				return
+			}
+		}
+		http.Error(w, "Failed to get node count", http.StatusInternalServerError)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+// GET /health
 func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := map[string]interface{}{
-		"status":   "healthy",
-		"regionId": c.regionID,
-		"nodes":    len(c.nodes),
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "health",
+		Response: responseChan,
 	}
+	
+	// Try to queue the message
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+// Legacy API mapping for web interface
+func (c *Controller) handleApiGrid(w http.ResponseWriter, r *http.Request) {
+	c.handleAggregatedState(w, r)
+}
+
+// GET /metrics
+func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	responseChan := make(chan interface{}, 1)
+	msg := &WebReadMessage{
+		Type:     "metrics",
+		Response: responseChan,
+	}
+	
+	// Try to queue the message
+	select {
+	case c.webReadChan <- msg:
+		atomic.AddInt64(&c.webReadQueueSize, 1)
+		// Wait for response
+		response := <-responseChan
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	default:
+		// Queue full
+		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
+	}
 }
 
 func main() {
@@ -405,24 +769,31 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// Core endpoints for simplified architecture
+	// Core endpoints
 	r.HandleFunc("/register", controller.handleRegister).Methods("POST")
 	r.HandleFunc("/state/{position}", controller.handleStateUpdate).Methods("POST")
 	r.HandleFunc("/halo/{position}", controller.handleHaloRequest).Methods("GET")
 	r.HandleFunc("/generation", controller.handleGeneration).Methods("GET")
 	r.HandleFunc("/aggregated-state", controller.handleAggregatedState).Methods("GET")
 	r.HandleFunc("/topology", controller.handleTopology).Methods("GET")
-	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
+	r.HandleFunc("/api/click", controller.handleClick).Methods("POST")
+	r.HandleFunc("/api/randomize", controller.handleRandomize).Methods("POST")
 	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
-
-	// Legacy API mapping for web interface
-	r.HandleFunc("/api/grid", controller.handleAggregatedState).Methods("GET")
+	
+	// Legacy API mapping
+	r.HandleFunc("/api/grid", controller.handleApiGrid).Methods("GET")
+	
+	// Metrics endpoint for web interface
+	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
 	}
 
-	log.Printf("Simplified Game of Life Controller starting on port %s (Region: %s)", port, controller.regionID)
+	log.Printf("Game of Life Controller with Channels starting on port %s (Region: %s)", port, controller.regionID)
+	log.Printf("Queue sizes: register=%d, stateUpdate=%d, haloRead=%d, webRead=%d",
+		cap(controller.registerChan), cap(controller.stateUpdateChan), 
+		cap(controller.haloReadChan), cap(controller.webReadChan))
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
 }

@@ -6,6 +6,7 @@ VERSION ?= latest
 build:
 	go build -o bin/engine ./cmd/engine
 	go build -o bin/controller ./cmd/controller
+	go build -o bin/router ./cmd/router
 	go build -o bin/web ./cmd/web
 
 run: build
@@ -18,6 +19,7 @@ docker-build:
 	@echo "Building all components..."
 	docker build -f Dockerfile.engine -t $(DOCKER_REGISTRY)/gameoflife-engine:$(VERSION) .
 	docker build -f Dockerfile.controller -t $(DOCKER_REGISTRY)/gameoflife-controller:$(VERSION) .
+	docker build -f Dockerfile.router -t $(DOCKER_REGISTRY)/gameoflife-router:$(VERSION) .
 	docker build -f Dockerfile.web -t $(DOCKER_REGISTRY)/gameoflife-web:$(VERSION) .
 
 docker-run: docker-build
@@ -30,6 +32,7 @@ docker-push: docker-build
 	@echo "Pushing images to $(DOCKER_REGISTRY)..."
 	docker push $(DOCKER_REGISTRY)/gameoflife-engine:$(VERSION)
 	docker push $(DOCKER_REGISTRY)/gameoflife-controller:$(VERSION)
+	docker push $(DOCKER_REGISTRY)/gameoflife-router:$(VERSION)
 	docker push $(DOCKER_REGISTRY)/gameoflife-web:$(VERSION)
 
 docker-multiarch:
