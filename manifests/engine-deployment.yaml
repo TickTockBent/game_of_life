@@ -53,7 +53,7 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         - name: CONTROLLER_URL
-          value: "https://gameoflife-api.ticktockbent.com"
+          value: "http://ticktockbent.com:8082"
         - name: SELF_ENDPOINT
           value: "http://$(POD_IP):8080"
         resources:

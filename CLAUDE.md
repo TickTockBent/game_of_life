@@ -161,5 +161,10 @@ make monitor
 - WebSocket API patterns
 - Distributed systems coordination patterns
 
+## Working Memory
+- **Current session notes**: `./documentation/tmp/working_memory.md`
+- Check this file for recent discoveries, bugs found, architecture changes, and next steps
+- Updated throughout development sessions to maintain context across cleanups
+
 ## Deployment Warnings
 - When redeploying, do not delete the namespace as that also removes the TLS and registry auth secrets.

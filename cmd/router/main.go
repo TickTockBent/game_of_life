@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -117,7 +118,14 @@ func (r *Router) processRegistrationQueue() {
 		if response.Error != nil {
 			http.Error(req.ClientWriter, response.Error.Error(), http.StatusServiceUnavailable)
 		} else {
-			req.ClientWriter.Header().Set("Content-Type", "application/json")
+			// Set headers first
+			for key, value := range response.Headers {
+				req.ClientWriter.Header().Set(key, value)
+			}
+			if req.ClientWriter.Header().Get("Content-Type") == "" {
+				req.ClientWriter.Header().Set("Content-Type", "application/json")
+			}
+			// Write status code before body
 			req.ClientWriter.WriteHeader(response.StatusCode)
 			req.ClientWriter.Write(response.Body)
 		}
@@ -215,9 +223,12 @@ func (r *Router) sendBatchToController(batch []*StateUpdateBatch) {
 	
 	// Respond to all clients in batch
 	for _, update := range batch {
+		update.ClientWriter.Header().Set("Content-Type", "application/json")
 		update.ClientWriter.WriteHeader(resp.StatusCode)
 		if resp.StatusCode != http.StatusOK {
-			update.ClientWriter.Write([]byte("Batch update failed"))
+			update.ClientWriter.Write([]byte(`{"error":"Batch update failed"}`))
+		} else {
+			update.ClientWriter.Write([]byte(`{"status":"ok"}`))
 		}
 	}
 	
@@ -235,9 +246,14 @@ func (r *Router) processWebReadQueue() {
 		if response.Error != nil {
 			http.Error(req.ClientWriter, response.Error.Error(), http.StatusServiceUnavailable)
 		} else {
+			// Set headers first
 			for key, value := range response.Headers {
 				req.ClientWriter.Header().Set(key, value)
 			}
+			if req.ClientWriter.Header().Get("Content-Type") == "" {
+				req.ClientWriter.Header().Set("Content-Type", "application/json")
+			}
+			// Write status code before body
 			req.ClientWriter.WriteHeader(response.StatusCode)
 			req.ClientWriter.Write(response.Body)
 		}
@@ -255,7 +271,14 @@ func (r *Router) processHaloQueue() {
 		if response.Error != nil {
 			http.Error(req.ClientWriter, response.Error.Error(), http.StatusServiceUnavailable)
 		} else {
-			req.ClientWriter.Header().Set("Content-Type", "application/json")
+			// Set headers first
+			for key, value := range response.Headers {
+				req.ClientWriter.Header().Set(key, value)
+			}
+			if req.ClientWriter.Header().Get("Content-Type") == "" {
+				req.ClientWriter.Header().Set("Content-Type", "application/json")
+			}
+			// Write status code before body
 			req.ClientWriter.WriteHeader(response.StatusCode)
 			req.ClientWriter.Write(response.Body)
 		}
@@ -288,11 +311,10 @@ func (r *Router) forwardToController(queuedReq *QueuedRequest) *QueuedResponse {
 	}
 	defer resp.Body.Close()
 	
-	// Read response body
-	body := make([]byte, 0)
-	if resp.ContentLength > 0 {
-		body = make([]byte, resp.ContentLength)
-		resp.Body.Read(body)
+	// Read response body - always read it regardless of Content-Length
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return &QueuedResponse{Error: fmt.Errorf("failed to read response body: %v", err)}
 	}
 	
 	// Copy response headers
@@ -313,10 +335,9 @@ func (r *Router) forwardToController(queuedReq *QueuedRequest) *QueuedResponse {
 // queueRequest queues a request for processing
 func (r *Router) queueRequest(queue chan *QueuedRequest, queueCounter *int64, w http.ResponseWriter, req *http.Request, path string) {
 	// Read request body
-	body := make([]byte, 0)
-	if req.ContentLength > 0 {
-		body = make([]byte, req.ContentLength)
-		req.Body.Read(body)
+	var body []byte
+	if req.ContentLength != 0 {
+		body, _ = io.ReadAll(req.Body)
 	}
 	
 	queuedReq := &QueuedRequest{
@@ -410,6 +431,16 @@ func (r *Router) handleTopology(w http.ResponseWriter, req *http.Request) {
 	r.queueRequest(r.webReadQueue, &r.webQueueSize, w, req, "/topology")
 }
 
+// POST /api/click - Web interface click handling
+func (r *Router) handleClick(w http.ResponseWriter, req *http.Request) {
+	r.queueRequest(r.webReadQueue, &r.webQueueSize, w, req, "/api/click")
+}
+
+// POST /api/randomize - Web interface randomize all
+func (r *Router) handleRandomize(w http.ResponseWriter, req *http.Request) {
+	r.queueRequest(r.webReadQueue, &r.webQueueSize, w, req, "/api/randomize")
+}
+
 // GET /metrics - Router metrics (not forwarded to controller)
 func (r *Router) handleMetrics(w http.ResponseWriter, req *http.Request) {
 	metrics := map[string]interface{}{
@@ -441,6 +472,7 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+
 func main() {
 	router := NewRouter()
 
@@ -458,6 +490,8 @@ func main() {
 	
 	// Legacy API mapping for web interface
 	r.HandleFunc("/api/grid", router.handleAggregatedState).Methods("GET")
+	r.HandleFunc("/api/click", router.handleClick).Methods("POST")
+	r.HandleFunc("/api/randomize", router.handleRandomize).Methods("POST")
 
 	// Router-specific endpoints
 	r.HandleFunc("/metrics", router.handleMetrics).Methods("GET")

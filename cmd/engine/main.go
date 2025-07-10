@@ -16,13 +16,14 @@ import (
 )
 
 type Engine struct {
-	grid          *gameoflife.Grid
-	nodeID        string
+	grid      *gameoflife.Grid
+	nodeID    string
 	controllerURL string
-	position      int
-	registered    bool
-	httpClient    *http.Client
-	stopChan      chan struct{}
+	position  int
+	registered bool
+	httpClient *http.Client
+	stopChan   chan struct{}
+	stepChan   chan struct{} // Channel to receive step signals
 }
 
 type HaloResponse struct {
@@ -67,6 +68,7 @@ func NewEngine() *Engine {
 		position:      -1,
 		httpClient:    httpClient,
 		stopChan:      make(chan struct{}),
+		stepChan:      make(chan struct{}, 10), // Buffered channel for step signals
 	}
 
 	// Randomize initial state
@@ -77,7 +79,7 @@ func NewEngine() *Engine {
 
 // Start begins the engine lifecycle
 func (e *Engine) Start() {
-	log.Printf("Starting engine %s with controller URL: %s", e.nodeID, e.controllerURL)
+	log.Printf("Starting engine %s with router URL: %s", e.nodeID, e.controllerURL)
 	
 	// 1. Register with controller
 	e.register()
@@ -89,14 +91,20 @@ func (e *Engine) Start() {
 	go e.startHTTPServer()
 }
 
-// register with controller to get position
+// register with router to get position (router forwards to controller)
 func (e *Engine) register() {
 	for !e.registered {
 		log.Printf("Attempting registration to %s/register", e.controllerURL)
 		
+		// Get pod IP for endpoint registration
+		podIP := os.Getenv("POD_IP")
+		if podIP == "" {
+			podIP = "localhost" // fallback for testing
+		}
+		
 		reqData := map[string]string{
 			"podId":    e.nodeID,
-			"endpoint": "http://placeholder:8080",
+			"endpoint": fmt.Sprintf("http://%s:8080", podIP),
 		}
 		
 		jsonData, _ := json.Marshal(reqData)
@@ -131,52 +139,58 @@ func (e *Engine) register() {
 			e.registered = true
 			log.Printf("Registered at position %d", e.position)
 			
-			// Push initial state
+			// Get current controller generation and sync with it
+			if controllerGen, err := e.getControllerGeneration(); err == nil {
+				e.grid.Generation = controllerGen
+				log.Printf("Synced to controller generation %d", controllerGen)
+			}
+			
+			// Push initial state (signals readiness for current generation)
 			e.pushState()
 		}
 	}
 }
 
-// gameLoop runs the autonomous Conway's Game of Life
+// gameLoop runs the barrier-synchronized Conway's Game of Life
 func (e *Engine) gameLoop() {
+	log.Printf("Starting barrier sync game loop for engine %s", e.nodeID)
+	
 	for {
 		select {
 		case <-e.stopChan:
 			return
-		default:
+		case <-e.stepChan:
 			if e.registered {
-				stepped := e.step()
-				if !stepped {
-					// We're caught up, wait before trying again
-					time.Sleep(100 * time.Millisecond)
-				}
-				// If we stepped, immediately try again (catch-up mode)
-			} else {
+				// Execute synchronized step
+				e.executeStep()
+			}
+		default:
+			if !e.registered {
 				time.Sleep(1 * time.Second) // Wait for registration
+			} else {
+				// Wait for step signal - no busy loop
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}
 }
 
-// step performs one game iteration, returns true if stepped, false if caught up
-func (e *Engine) step() bool {
-	// 1. Check if we should step based on controller generation
+// executeStep performs one synchronized game iteration when signaled by controller
+func (e *Engine) executeStep() {
+	log.Printf("Engine %s executing step", e.nodeID)
+	
+	// 1. Get current controller generation
 	controllerGen, err := e.getControllerGeneration()
 	if err != nil {
 		log.Printf("Failed to get controller generation: %v", err)
-		return false
-	}
-	
-	// Don't step if we're already at or ahead of controller generation
-	if e.grid.Generation >= controllerGen {
-		return false // Caught up, no step needed
+		return
 	}
 	
 	// 2. Get halo data from controller
 	_, err = e.getHalo()
 	if err != nil {
 		log.Printf("Failed to get halo: %v", err)
-		return false
+		return
 	}
 	
 	// 3. Apply halo to grid (TODO: implement halo application)
@@ -184,10 +198,13 @@ func (e *Engine) step() bool {
 	e.grid.ComputeNextGeneration()
 	e.grid.CommitNextGeneration()
 	
-	// 4. Push new state to controller
+	// 4. Sync our generation with controller
+	e.grid.Generation = controllerGen
+	
+	// 5. Push new state to controller (this signals readiness for next generation)
 	e.pushState()
 	
-	return true // Successfully stepped
+	log.Printf("Engine %s completed step for generation %d", e.nodeID, controllerGen)
 }
 
 // getHalo fetches surrounding cells from controller
@@ -210,7 +227,7 @@ func (e *Engine) getHalo() ([9][9]bool, error) {
 	return haloResp.HaloCells, err
 }
 
-// getControllerGeneration fetches current generation from controller
+// getControllerGeneration fetches current generation from router
 func (e *Engine) getControllerGeneration() (int, error) {
 	url := fmt.Sprintf("%s/generation", e.controllerURL)
 	log.Printf("DEBUG: Attempting to GET %s", url)
@@ -276,10 +293,11 @@ func (e *Engine) pushState() {
 	}
 }
 
-// startHTTPServer provides health check endpoint
+// startHTTPServer provides health check and step signal endpoints
 func (e *Engine) startHTTPServer() {
 	r := mux.NewRouter()
 	r.HandleFunc("/health", e.handleHealth).Methods("GET")
+	r.HandleFunc("/step", e.handleStep).Methods("POST")
 	
 	port := "8080"
 	log.Printf("HTTP server starting on port %s", port)
@@ -297,6 +315,25 @@ func (e *Engine) handleHealth(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(health)
+}
+
+// handleStep receives step signal from controller
+func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
+	if !e.registered {
+		http.Error(w, "Engine not registered", http.StatusServiceUnavailable)
+		return
+	}
+	
+	// Send step signal to game loop
+	select {
+	case e.stepChan <- struct{}{}:
+		w.WriteHeader(http.StatusOK)
+		log.Printf("Engine %s received step signal", e.nodeID)
+	default:
+		// Channel full, step already queued
+		w.WriteHeader(http.StatusOK)
+		log.Printf("Engine %s step signal already queued", e.nodeID)
+	}
 }
 
 func main() {

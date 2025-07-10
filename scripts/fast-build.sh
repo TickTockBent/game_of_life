@@ -106,7 +106,7 @@ rm -f "/tmp/build_result_engine" "/tmp/build_result_controller" "/tmp/build_resu
 echo ""
 echo "📊 Build Results:"
 [ $ENGINE_RESULT -eq 0 ] && echo "✅ Engine: Success" || echo "❌ Engine: Failed"
-[ $CONTROLLER_RESULT -eq 0 ] && echo "✅ Controller: Success" || echo "❌ Controller: Failed"  
+[ $CONTROLLER_RESULT -eq 0 ] && echo "✅ Controller: Success" || echo "❌ Controller: Failed"
 [ $WEB_RESULT -eq 0 ] && echo "✅ Web: Success" || echo "❌ Web: Failed"
 
 if [ $ENGINE_RESULT -eq 0 ] && [ $CONTROLLER_RESULT -eq 0 ] && [ $WEB_RESULT -eq 0 ]; then
@@ -115,7 +115,7 @@ if [ $ENGINE_RESULT -eq 0 ] && [ $CONTROLLER_RESULT -eq 0 ] && [ $WEB_RESULT -eq
     echo ""
     echo "Images ready:"
     echo "  $REGISTRY/gameoflife-engine:$VERSION"
-    echo "  $REGISTRY/gameoflife-controller:$VERSION"  
+    echo "  $REGISTRY/gameoflife-controller:$VERSION"
     echo "  $REGISTRY/gameoflife-web:$VERSION"
     exit 0
 else

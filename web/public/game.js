@@ -43,8 +43,8 @@ class GameOfLifeVisualizer {
             }
         };
         
-        // Smooth refresh rate for better user experience
-        this.refreshInterval = setInterval(refreshData, 200); // 200ms for smoother updates
+        // Refresh rate aligned with controller generation timing
+        this.refreshInterval = setInterval(refreshData, 500); // 500ms for smooth updates with less pressure
     }
     
     async refreshData() {
@@ -428,6 +428,40 @@ class GameOfLifeVisualizer {
                     const now = Math.floor(Date.now() / 1000);
                     const age = now - metrics.timestamp;
                     document.getElementById('lastStep').textContent = `${age}s ago`;
+                }
+                
+                // Router queue metrics (multiple queues)
+                const totalQueueSize = metrics.totalQueueSize || 
+                                     (metrics.regQueueSize || 0) + 
+                                     (metrics.batchQueueSize || 0) + 
+                                     (metrics.webQueueSize || 0) + 
+                                     (metrics.haloQueueSize || 0);
+                
+                if (totalQueueSize !== undefined) {
+                    const queueEl = document.getElementById('queueSize');
+                    if (queueEl) {
+                        // Show breakdown of queue sizes
+                        const breakdown = [];
+                        if (metrics.regQueueSize > 0) breakdown.push(`R:${metrics.regQueueSize}`);
+                        if (metrics.batchQueueSize > 0) breakdown.push(`S:${metrics.batchQueueSize}`);
+                        if (metrics.webQueueSize > 0) breakdown.push(`W:${metrics.webQueueSize}`);
+                        if (metrics.haloQueueSize > 0) breakdown.push(`H:${metrics.haloQueueSize}`);
+                        
+                        if (breakdown.length > 0) {
+                            queueEl.textContent = `${totalQueueSize} (${breakdown.join(', ')})`;
+                        } else {
+                            queueEl.textContent = totalQueueSize;
+                        }
+                        
+                        // Color-code based on total queue size
+                        if (totalQueueSize > 500) {
+                            queueEl.style.color = 'red';
+                        } else if (totalQueueSize > 100) {
+                            queueEl.style.color = 'orange';
+                        } else {
+                            queueEl.style.color = 'green';
+                        }
+                    }
                 }
             }
         } catch (error) {

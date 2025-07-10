@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gameoflife-api-ingress
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+    component: controller
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.priority: "10"
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: gameoflife-api.ticktockbent.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: gameoflife-controller
+            port:
+              number: 8081
+  tls:
+  - hosts:
+    - gameoflife-api.ticktockbent.com
+    secretName: gameoflife-api-tls
