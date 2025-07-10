@@ -24,6 +24,7 @@ type Engine struct {
 	httpClient *http.Client
 	stopChan   chan struct{}
 	stepChan   chan struct{} // Channel to receive step signals
+	failedPushes int         // Count of consecutive failed state pushes
 }
 
 type HaloResponse struct {
@@ -284,12 +285,31 @@ func (e *Engine) pushState() {
 	resp, err := e.httpClient.Post(url, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
 		log.Printf("Failed to push state: %v", err)
+		e.failedPushes++
+		e.checkReregistration()
 		return
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != 200 {
 		log.Printf("State push rejected: %d", resp.StatusCode)
+		e.failedPushes++
+		e.checkReregistration()
+		return
+	}
+	
+	// Success - reset failure counter
+	e.failedPushes = 0
+}
+
+// checkReregistration triggers re-registration if too many pushes have failed
+func (e *Engine) checkReregistration() {
+	if e.failedPushes >= 3 {
+		log.Printf("Engine %s failed %d consecutive state pushes, re-registering", e.nodeID, e.failedPushes)
+		e.registered = false
+		e.position = -1
+		e.failedPushes = 0
+		// Registration will happen in the next game loop iteration
 	}
 }
 

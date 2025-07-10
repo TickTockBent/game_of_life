@@ -56,7 +56,7 @@ func NewGrid() *Grid {
 	return &Grid{
 		neighbors: make(map[string]string),
 		crosstalkEnabled: false,
-		boringThreshold: 100, // Auto-randomize after 100 empty generations
+		boringThreshold: 1000, // Auto-randomize after 1000 empty generations
 		edgeData: edgeData,
 		// Pre-allocate halo regions too
 		haloNorth: make([]bool, GridSize),
@@ -68,8 +68,8 @@ func NewGrid() *Grid {
 		// Staleness detection
 		stateHistory: stateHistory,
 		historySize: historySize,
-		oscillationThreshold: 50, // Detect stable patterns after 50 generations
-		lowActivityThreshold: 3,  // Less than 3 cells changing = low activity
+		oscillationThreshold: 200, // Detect stable patterns after 200 generations
+		lowActivityThreshold: 3,   // Less than 3 cells changing = low activity
 		lowActivityGenerations: 0,
 	}
 }
@@ -373,7 +373,7 @@ func (g *Grid) statesEqual(state1, state2 [GridSize][GridSize]Cell) bool {
 // isStale determines if the grid should be randomized based on multiple criteria
 func (g *Grid) isStale() bool {
 	// Stale if low activity for too long
-	if g.lowActivityGenerations >= 75 { // 75 generations of minimal change
+	if g.lowActivityGenerations >= 300 { // 300 generations of minimal change
 		return true
 	}
 	
