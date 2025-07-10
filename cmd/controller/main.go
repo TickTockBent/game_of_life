@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
 
 // Controller with channel-based message handling and zero locks
@@ -33,6 +35,11 @@ type Controller struct {
 	readyEngines      map[int]bool  // tracks which engines are ready for current generation
 	stepInProgress    bool          // true when step broadcast is in progress
 	barrierTimeout    time.Duration // timeout for waiting for all engines
+	
+	// WebSocket clients for real-time updates
+	wsClients    map[*websocket.Conn]bool // connected WebSocket clients
+	wsMutex      sync.RWMutex             // protects wsClients map
+	wsUpgrader   websocket.Upgrader       // WebSocket upgrader
 	
 	// Metrics (atomic counters)
 	registerQueueSize    int64
@@ -81,6 +88,7 @@ type NodeInfo struct {
 	Endpoint      string    `json:"endpoint"`
 	RegisteredAt  time.Time `json:"registeredAt"`
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
+	MissedSteps   int       `json:"missedSteps"` // Count of consecutive missed state pushes
 }
 
 type Position struct {
@@ -148,6 +156,12 @@ func NewController() *Controller {
 		readyEngines:      make(map[int]bool),
 		stepInProgress:    false,
 		barrierTimeout:    1000 * time.Millisecond, // 1 second barrier timeout
+		wsClients:         make(map[*websocket.Conn]bool),
+		wsUpgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow all origins for development
+			},
+		},
 	}
 	
 	// Start the main message processor
@@ -408,14 +422,48 @@ func (c *Controller) broadcastStepToAllEngines() {
 	
 	log.Printf("Broadcasting step signal for generation %d to %d engines", newGeneration, len(c.nodes))
 	
+	// Track which engines didn't participate in the last step
+	c.updateMissedSteps()
+	
 	// Send step signal to all engines via HTTP
 	for position := range c.nodes {
 		go c.sendStepSignalToEngine(position)
 	}
 	
+	// Clean up stale engines before next step
+	c.cleanupStaleEngines()
+	
+	// Broadcast updated state to WebSocket clients
+	c.broadcastToWebSocketClients()
+	
 	// Reset readiness tracking for next generation
 	c.readyEngines = make(map[int]bool)
 	c.stepInProgress = false
+}
+
+// updateMissedSteps increments missed step count for engines that didn't report ready
+func (c *Controller) updateMissedSteps() {
+	for position, node := range c.nodes {
+		if c.readyEngines[position] {
+			// Engine was ready, reset missed steps
+			node.MissedSteps = 0
+		} else {
+			// Engine missed this step
+			node.MissedSteps++
+		}
+	}
+}
+
+// cleanupStaleEngines removes engines that have missed too many steps
+func (c *Controller) cleanupStaleEngines() {
+	for position, node := range c.nodes {
+		if node.MissedSteps >= 3 {
+			log.Printf("Removing stale engine %s at position %d (missed %d steps)", 
+				node.PodID, position, node.MissedSteps)
+			delete(c.nodes, position)
+			delete(c.gridStates, position)
+		}
+	}
 }
 
 // sendStepSignalToEngine sends step signal to a specific engine
@@ -446,6 +494,60 @@ func (c *Controller) sendStepSignalToEngine(position int) {
 func (c *Controller) processStepBroadcast(position int) error {
 	// This can be used for engine-initiated step requests if needed
 	return nil
+}
+
+// broadcastToWebSocketClients sends current aggregated state to all connected WebSocket clients
+func (c *Controller) broadcastToWebSocketClients() {
+	// Get current aggregated state
+	nodes := make(map[int]*NodeInfo)
+	for k, v := range c.nodes {
+		nodes[k] = v
+	}
+
+	grids := make(map[string]*GridState)
+	for position, state := range c.gridStates {
+		grids[strconv.Itoa(position)] = state
+	}
+
+	aggregatedState := &AggregatedStateResponse{
+		Topology: &TopologyResponse{
+			RegionID: c.regionID,
+			Nodes:    nodes,
+		},
+		Grids: grids,
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(aggregatedState)
+	if err != nil {
+		log.Printf("Failed to marshal WebSocket data: %v", err)
+		return
+	}
+
+	// Broadcast to all connected clients
+	c.wsMutex.RLock()
+	defer c.wsMutex.RUnlock()
+
+	for client := range c.wsClients {
+		err := client.WriteMessage(websocket.TextMessage, jsonData)
+		if err != nil {
+			log.Printf("WebSocket write error: %v", err)
+			// Remove disconnected client
+			go c.removeWebSocketClient(client)
+		}
+	}
+}
+
+// removeWebSocketClient safely removes a disconnected client
+func (c *Controller) removeWebSocketClient(client *websocket.Conn) {
+	c.wsMutex.Lock()
+	defer c.wsMutex.Unlock()
+	
+	if _, exists := c.wsClients[client]; exists {
+		delete(c.wsClients, client)
+		client.Close()
+		log.Printf("Removed disconnected WebSocket client")
+	}
 }
 
 // barrierCoordinator manages the barrier synchronization for distributed stepping
@@ -764,6 +866,74 @@ func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleWebSocket upgrades HTTP connections to WebSocket for real-time updates
+func (c *Controller) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := c.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+
+	// Add client to active connections
+	c.wsMutex.Lock()
+	c.wsClients[conn] = true
+	clientCount := len(c.wsClients)
+	c.wsMutex.Unlock()
+
+	log.Printf("New WebSocket client connected (total: %d)", clientCount)
+
+	// Send initial state immediately
+	c.sendInitialState(conn)
+
+	// Handle client disconnection
+	defer func() {
+		c.removeWebSocketClient(conn)
+	}()
+
+	// Keep connection alive by reading ping/pong messages
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("WebSocket read error: %v", err)
+			break
+		}
+	}
+}
+
+// sendInitialState sends current aggregated state to a new WebSocket client
+func (c *Controller) sendInitialState(conn *websocket.Conn) {
+	// Get current aggregated state
+	nodes := make(map[int]*NodeInfo)
+	for k, v := range c.nodes {
+		nodes[k] = v
+	}
+
+	grids := make(map[string]*GridState)
+	for position, state := range c.gridStates {
+		grids[strconv.Itoa(position)] = state
+	}
+
+	aggregatedState := &AggregatedStateResponse{
+		Topology: &TopologyResponse{
+			RegionID: c.regionID,
+			Nodes:    nodes,
+		},
+		Grids: grids,
+	}
+
+	// Convert to JSON and send
+	jsonData, err := json.Marshal(aggregatedState)
+	if err != nil {
+		log.Printf("Failed to marshal initial WebSocket data: %v", err)
+		return
+	}
+
+	err = conn.WriteMessage(websocket.TextMessage, jsonData)
+	if err != nil {
+		log.Printf("Failed to send initial WebSocket data: %v", err)
+	}
+}
+
 func main() {
 	controller := NewController()
 
@@ -785,6 +955,9 @@ func main() {
 	
 	// Metrics endpoint for web interface
 	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
+	
+	// WebSocket endpoint for real-time updates
+	r.HandleFunc("/ws", controller.handleWebSocket)
 
 	port := os.Getenv("PORT")
 	if port == "" {

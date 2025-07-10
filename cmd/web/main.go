@@ -7,15 +7,18 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
 
 type WebServer struct {
 	controllerURL string
 	httpClient    *http.Client
+	wsUpgrader    websocket.Upgrader
 }
 
 type CellClickRequest struct {
@@ -45,6 +48,11 @@ func NewWebServer() *WebServer {
 	return &WebServer{
 		controllerURL: controllerURL,
 		httpClient:    httpClient,
+		wsUpgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow all origins for development
+			},
+		},
 	}
 }
 
@@ -315,6 +323,84 @@ func (w *WebServer) fetchControllerMetrics() (map[string]interface{}, error) {
 	return metrics, nil
 }
 
+// handleWebSocket proxies WebSocket connections to the controller
+func (w *WebServer) handleWebSocket(rw http.ResponseWriter, r *http.Request) {
+	// Parse controller URL for WebSocket connection
+	controllerURL, err := url.Parse(w.controllerURL)
+	if err != nil {
+		log.Printf("Failed to parse controller URL: %v", err)
+		http.Error(rw, "Invalid controller URL", http.StatusInternalServerError)
+		return
+	}
+
+	// Create WebSocket URL
+	wsScheme := "ws"
+	if controllerURL.Scheme == "https" {
+		wsScheme = "wss"
+	}
+	wsURL := fmt.Sprintf("%s://%s/ws", wsScheme, controllerURL.Host)
+
+	// Upgrade client connection to WebSocket
+	clientConn, err := w.wsUpgrader.Upgrade(rw, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade client WebSocket: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// Connect to controller WebSocket
+	controllerConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		log.Printf("Failed to connect to controller WebSocket: %v", err)
+		clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Controller connection failed"))
+		return
+	}
+	defer controllerConn.Close()
+
+	log.Printf("WebSocket proxy established: client <-> web <-> controller")
+
+	// Start bidirectional proxy
+	done := make(chan struct{})
+
+	// Proxy controller -> client
+	go func() {
+		defer close(done)
+		for {
+			messageType, data, err := controllerConn.ReadMessage()
+			if err != nil {
+				log.Printf("Controller WebSocket read error: %v", err)
+				return
+			}
+
+			err = clientConn.WriteMessage(messageType, data)
+			if err != nil {
+				log.Printf("Client WebSocket write error: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Proxy client -> controller
+	go func() {
+		for {
+			messageType, data, err := clientConn.ReadMessage()
+			if err != nil {
+				log.Printf("Client WebSocket read error: %v", err)
+				return
+			}
+
+			err = controllerConn.WriteMessage(messageType, data)
+			if err != nil {
+				log.Printf("Controller WebSocket write error: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Wait for connection to close
+	<-done
+}
+
 func main() {
 	webServer := NewWebServer()
 
@@ -330,6 +416,9 @@ func main() {
 	r.HandleFunc("/api/click", webServer.handleCellClick).Methods("POST")
 	r.HandleFunc("/api/randomize", webServer.handleRandomizeAll).Methods("POST")
 	r.HandleFunc("/api/metrics", webServer.handleMetrics).Methods("GET")
+	
+	// WebSocket endpoint for real-time updates
+	r.HandleFunc("/ws", webServer.handleWebSocket)
 	
 	// Main page
 	r.HandleFunc("/", webServer.handleIndex).Methods("GET")

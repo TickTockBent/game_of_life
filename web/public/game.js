@@ -8,19 +8,21 @@ class GameOfLifeVisualizer {
         this.lastUpdateTime = Date.now();
         this.isUpdating = false; // Prevent concurrent updates
         this.currentInterval = 300; // Track current refresh interval
+        this.websocket = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
         
         this.setupEventListeners();
-        this.refreshData();
         
-        // Auto-refresh with adaptive rate based on node count
-        this.startAdaptiveRefresh();
+        // Start WebSocket connection for real-time updates
+        this.connectWebSocket();
         
         // Update timing display every second
         setInterval(() => {
             this.updateTimingDisplay();
         }, 1000);
         
-        // Update metrics every 2 seconds
+        // Update metrics every 2 seconds (still use polling for metrics)
         setInterval(() => {
             this.updateMetrics();
         }, 2000);
@@ -36,15 +38,108 @@ class GameOfLifeVisualizer {
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
     }
     
-    startAdaptiveRefresh() {
-        const refreshData = () => {
+    connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        
+        console.log(`Connecting to WebSocket: ${wsUrl}`);
+        
+        try {
+            this.websocket = new WebSocket(wsUrl);
+            
+            this.websocket.onopen = () => {
+                console.log('WebSocket connected - real-time updates enabled');
+                this.reconnectAttempts = 0;
+                document.getElementById('connectionStatus').textContent = 'Connected (WebSocket)';
+                document.getElementById('connectionStatus').style.color = 'green';
+            };
+            
+            this.websocket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    this.handleRealtimeUpdate(data);
+                } catch (error) {
+                    console.error('Failed to parse WebSocket message:', error);
+                }
+            };
+            
+            this.websocket.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('connectionStatus').textContent = 'Disconnected';
+                document.getElementById('connectionStatus').style.color = 'red';
+                this.handleWebSocketReconnect();
+            };
+            
+            this.websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                document.getElementById('connectionStatus').textContent = 'Error';
+                document.getElementById('connectionStatus').style.color = 'red';
+            };
+            
+        } catch (error) {
+            console.error('Failed to create WebSocket:', error);
+            this.fallbackToPolling();
+        }
+    }
+    
+    handleWebSocketReconnect() {
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff, max 30s
+            console.log(`Reconnecting WebSocket in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+            
+            setTimeout(() => {
+                this.connectWebSocket();
+            }, delay);
+        } else {
+            console.log('Max reconnection attempts reached, falling back to polling');
+            this.fallbackToPolling();
+        }
+    }
+    
+    fallbackToPolling() {
+        console.log('Using polling fallback for updates');
+        document.getElementById('connectionStatus').textContent = 'Polling Fallback';
+        document.getElementById('connectionStatus').style.color = 'orange';
+        
+        // Start polling as fallback
+        this.refreshInterval = setInterval(() => {
             if (!this.isUpdating) {
                 this.refreshData();
             }
-        };
+        }, 1000); // 1 second polling interval
+    }
+    
+    handleRealtimeUpdate(data) {
+        if (this.isUpdating) return; // Skip if still processing previous update
         
-        // Refresh rate aligned with controller generation timing
-        this.refreshInterval = setInterval(refreshData, 500); // 500ms for smooth updates with less pressure
+        this.isUpdating = true;
+        try {
+            // Process real-time data
+            if (data.grids && data.topology) {
+                // Merge new data with existing to prevent flickering
+                if (this.gridData) {
+                    // Keep existing grids if new data is missing them
+                    for (const position in this.gridData) {
+                        if (!data.grids[position]) {
+                            data.grids[position] = this.gridData[position];
+                        }
+                    }
+                }
+                
+                this.gridData = data.grids;
+                this.topology = data.topology;
+                this.lastUpdateTime = Date.now();
+                
+                this.updateStatus();
+                this.updateNodeInfo();
+                this.draw();
+            }
+        } catch (error) {
+            console.error('Failed to process real-time update:', error);
+        } finally {
+            this.isUpdating = false;
+        }
     }
     
     async refreshData() {
