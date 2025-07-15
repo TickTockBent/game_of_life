@@ -29,13 +29,8 @@ class GameOfLifeVisualizer {
     }
     
     setupEventListeners() {
-        // Control buttons (removed play/pause/step)
-        document.getElementById('clearBtn').addEventListener('click', () => this.clearAll());
-        document.getElementById('randomBtn').addEventListener('click', () => this.randomizeAll());
-        document.getElementById('refreshBtn').addEventListener('click', () => this.refreshData());
-        
-        // Canvas click handling
-        this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
+        // Control buttons removed - no longer interactive
+        // Canvas click handling removed - no longer interactive
     }
     
     connectWebSocket() {
