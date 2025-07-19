@@ -193,7 +193,12 @@ docker logs -f gameoflife-controller
 - **Auto-healing**: Removes engines that miss 3+ consecutive steps  
 - **WebSocket Streaming**: Real-time updates to web clients
 - **State Management**: Aggregates grid states from all engines
-- **API Endpoints**: `/register`, `/state/{position}`, `/halo/{position}`, `/ws`, `/metrics`
+- **API Endpoints**: 
+  - Core: `/register`, `/state/{position}`, `/halo/{position}`, `/generation`, `/health`
+  - Web Interface: `/topology`, `/aggregated-state`, `/metrics`, `/ws`
+  - Legacy: `/api/grid` (maps to `/aggregated-state`)
+  - Interactive: `/api/click`, `/api/randomize`
+  - Debug: `/debug/pause`, `/debug/unpause`, `/debug/nextstep`
 
 ### Web Frontend (cmd/web/main.go + web/public/)
 - **WebSocket Proxy**: Proxies WebSocket connections between browser and controller

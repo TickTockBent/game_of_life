@@ -1,0 +1,42 @@
+# Public Game of Life Engine
+# This container can be run by anyone to contribute to the distributed grid
+
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies
+RUN apk add --no-cache git
+
+# Copy go mod files
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# Copy source code
+COPY cmd/public-engine/ ./cmd/public-engine/
+COPY pkg/ ./pkg/
+
+# Build the public engine
+RUN CGO_ENABLED=0 GOOS=linux go build -o public-engine ./cmd/public-engine
+
+# Final stage
+FROM alpine:latest
+
+# Install CA certificates for HTTPS
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+# Copy the binary
+COPY --from=builder /app/public-engine .
+
+# Expose port 8080 for health checks and step signals
+EXPOSE 8080
+
+# Environment variables with defaults
+ENV CONTROLLER_URL=http://ticktockbent.com:8082
+ENV DISPLAY_NAME=Anonymous
+ENV PORT=8080
+
+# Run the engine
+CMD ["./public-engine"]
