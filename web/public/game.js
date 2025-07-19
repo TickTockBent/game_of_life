@@ -242,8 +242,12 @@ class GameOfLifeVisualizer {
                 const gridState = this.gridData[position];
                 const generation = gridState ? gridState.generation : 0;
                 
+                // Show display name if available, otherwise show podId
+                const displayName = node.displayName || node.podId;
+                const nodeTitle = node.displayName ? `${displayName} (${node.podId})` : node.podId;
+                
                 nodeCard.innerHTML = `
-                    <h4>Node ${node.podId}</h4>
+                    <h4>${nodeTitle}</h4>
                     <p>Position: (${node.position.row}, ${node.position.col})</p>
                     <p class="generation">Generation: ${generation}</p>
                 `;

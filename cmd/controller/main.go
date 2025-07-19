@@ -87,6 +87,7 @@ type StepBroadcastMessage struct {
 // Data types
 type NodeInfo struct {
 	PodID         string    `json:"podId"`
+	DisplayName   string    `json:"displayName,omitempty"` // Optional user-friendly name
 	Position      Position  `json:"position"`
 	Endpoint      string    `json:"endpoint"`
 	RegisteredAt  time.Time `json:"registeredAt"`
@@ -106,8 +107,9 @@ type GridState struct {
 }
 
 type RegisterRequest struct {
-	PodID    string `json:"podId"`
-	Endpoint string `json:"endpoint"`
+	PodID       string `json:"podId"`
+	Endpoint    string `json:"endpoint"`
+	DisplayName string `json:"displayName,omitempty"` // Optional user-friendly name
 }
 
 type RegisterResponse struct {
@@ -248,6 +250,7 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 	now := time.Now()
 	c.nodes[position] = &NodeInfo{
 		PodID:         req.PodID,
+		DisplayName:   req.DisplayName, // Store display name if provided
 		Position:      Position{Row: row, Col: col},
 		Endpoint:      req.Endpoint,
 		RegisteredAt:  now,
