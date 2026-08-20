@@ -94,7 +94,7 @@
     <div class="container">
         <div class="header">
             <h1>Distributed Conway's Game of Life</h1>
-            <p>Each grid section is computed by a different Kubernetes pod</p>
+            <p>Each grid section is computed by a separate engine process, kept in lockstep by a central controller</p>
         </div>
         
         
@@ -132,11 +132,17 @@
         <div class="node-info">
             <h3>What You're Seeing</h3>
             <p style="margin: 10px 0; line-height: 1.6; color: #555;">
-                This is <strong>Conway's Game of Life</strong> running across a distributed Kubernetes cluster. 
-                Each colored section of the grid is computed by a different pod on a different physical node. 
-                The patterns you see can flow seamlessly across pod boundaries, demonstrating true distributed computing 
-                where multiple machines work together to simulate a single, unified cellular automaton. 
-                All pods step forward in perfect synchronization every second using barrier synchronization.
+                This is <strong>Conway's Game of Life</strong> split across a set of independent engine
+                containers. Each colored section of the grid is owned by one engine, which computes only its
+                own 7&times;7 cells. Engines never talk to each other: before every step each one asks the
+                controller for a one-cell &ldquo;halo&rdquo; of its neighbours&rsquo; border cells, so patterns
+                flow seamlessly across section boundaries as if it were one grid.
+                A central controller uses <strong>barrier synchronization</strong> to keep every engine on the
+                same generation &mdash; it broadcasts a step only once all engines have reported in (or a
+                one-second timeout expires). Engines can be added or removed at any time; the grid simply
+                grows or shrinks. It currently runs as a Docker Compose stack on a single home-lab server,
+                but the same code ran across a multi-node Kubernetes cluster, and nothing in the design
+                assumes the engines share a machine.
             </p>
         </div>
         
