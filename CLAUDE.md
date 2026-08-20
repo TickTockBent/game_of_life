@@ -254,7 +254,7 @@ make scale ENGINES=9   # grow the grid (up to 100 positions in the 10x10 layout)
 make status / logs / down
 ```
 
-- Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain)
+- Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain), public at https://gameoflife.wshoffner.dev via `cloudflared-gameoflife.service`
 - Controller API: http://localhost:8082 (container port 8081)
 - Engines have no host ports; the controller reaches them on the compose network. The engine
   derives its node ID from the container hostname and its endpoint from its own interface IP

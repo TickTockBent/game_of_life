@@ -24,6 +24,13 @@
 - Most Go files are not gofmt'd.
 - `regionId` defaults to "k3s-cluster" (REGION_ID env) — cosmetic.
 
+### Public exposure (2026-08-20)
+- https://gameoflife.wshoffner.dev → `cloudflared-gameoflife.service` → web `:8090` (tunnel
+  `gameservers`, UUID f0539d6a…). Controller API is NOT exposed; web proxies /api + /ws.
+- Consequence: public engines can't register from outside until/unless the API is exposed
+  (and /register, /debug/* would need protection first).
+- All changes committed in 30cbd32; lab notebook updated (external-access.md, services.md).
+
 ### Next ideas
 - Public engine needs a reachable controller again (tunnel) before it's useful.
 - Layout is hardcoded 10x10 positions; >100 engines would need topology work.
