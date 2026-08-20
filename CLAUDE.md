@@ -242,7 +242,26 @@ docker logs -f gameoflife-controller
 - Performance benchmarks for ARM vs AMD64 nodes
 - UI interaction and animation tests
 
-## Current Deployment Architecture
+## Current Deployment (August 2026) — Local Docker Compose
+
+The K3s cluster, private registry (`192.168.68.100:5000`), and `gameoflife*.ticktockbent.com`
+DNS/tunnel were all retired in the lab move. **The K8s manifests and registry-based Makefile
+targets below are historical.** The project now runs locally via `docker-compose.yml`:
+
+```bash
+make up ENGINES=3      # build + start controller, web, 3 engines
+make scale ENGINES=9   # grow the grid (up to 100 positions in the 10x10 layout)
+make status / logs / down
+```
+
+- Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain)
+- Controller API: http://localhost:8082 (container port 8081)
+- Engines have no host ports; the controller reaches them on the compose network. The engine
+  derives its node ID from the container hostname and its endpoint from its own interface IP
+  when `POD_NAME`/`POD_IP` are absent, so `--scale` just works.
+- Engines re-register automatically if no step signal arrives for 10s (controller restart).
+
+## Historical: K3s Deployment Architecture
 - **Controller**: External Docker container on host (port 8082)
 - **Engines**: K3s DaemonSet with auto-scaling (up to 100 tested)
 - **Web**: K3s Deployment with WebSocket proxy

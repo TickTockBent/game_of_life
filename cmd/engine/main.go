@@ -25,7 +25,13 @@ type Engine struct {
 	stopChan   chan struct{}
 	stepChan   chan struct{} // Channel to receive step signals
 	failedPushes int         // Count of consecutive failed state pushes
+	lastStepSignal time.Time // When the controller last told us to step
 }
+
+// stepSignalTimeout is how long an engine tolerates silence from the
+// controller before assuming its registration was lost. The controller's
+// barrier timeout is 1s, so 10s of silence is unambiguous.
+const stepSignalTimeout = 10 * time.Second
 
 type HaloResponse struct {
 	HaloCells [9][9]bool `json:"haloCells"`
@@ -33,10 +39,14 @@ type HaloResponse struct {
 
 func NewEngine() *Engine {
 	// Get unique pod identifier
+	// Prefer the Kubernetes pod name; otherwise fall back to the container
+	// hostname (unique per container under docker compose --scale).
 	podName := os.Getenv("POD_NAME")
 	var nodeID string
 	if podName != "" && len(podName) >= 5 {
 		nodeID = podName[len(podName)-5:]
+	} else if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		nodeID = hostname
 	} else {
 		nodeID = "test"
 	}
@@ -97,10 +107,11 @@ func (e *Engine) register() {
 	for !e.registered {
 		log.Printf("Attempting registration to %s/register", e.controllerURL)
 		
-		// Get pod IP for endpoint registration
+		// Get pod IP for endpoint registration. Under Kubernetes POD_IP is
+		// injected; under docker compose we resolve our own routable address.
 		podIP := os.Getenv("POD_IP")
 		if podIP == "" {
-			podIP = "localhost" // fallback for testing
+			podIP = detectOwnIP()
 		}
 		
 		reqData := map[string]string{
@@ -138,6 +149,7 @@ func (e *Engine) register() {
 		if pos, ok := regResp["position"].(float64); ok {
 			e.position = int(pos)
 			e.registered = true
+			e.lastStepSignal = time.Now()
 			log.Printf("Registered at position %d", e.position)
 			
 			// Get current controller generation and sync with it
@@ -167,11 +179,20 @@ func (e *Engine) gameLoop() {
 			}
 		default:
 			if !e.registered {
-				time.Sleep(1 * time.Second) // Wait for registration
-			} else {
-				// Wait for step signal - no busy loop
-				time.Sleep(100 * time.Millisecond)
+				// Lost registration (controller restart, network blip): register again.
+				e.register()
+				continue
 			}
+			// Watchdog: a healthy controller steps at least once per barrier
+			// timeout. If we've heard nothing for stepSignalTimeout, assume the
+			// controller forgot us (e.g. it restarted) and re-register.
+			if !e.lastStepSignal.IsZero() && time.Since(e.lastStepSignal) > stepSignalTimeout {
+				log.Printf("Engine %s: no step signal for %v, re-registering", e.nodeID, stepSignalTimeout)
+				e.registered = false
+				continue
+			}
+			// Wait for step signal - no busy loop
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
@@ -369,7 +390,8 @@ func (e *Engine) startHTTPServer() {
 	r := mux.NewRouter()
 	r.HandleFunc("/health", e.handleHealth).Methods("GET")
 	r.HandleFunc("/step", e.handleStep).Methods("POST")
-	
+	r.HandleFunc("/randomize", e.handleRandomize).Methods("POST")
+
 	port := "8080"
 	log.Printf("HTTP server starting on port %s", port)
 	http.ListenAndServe(":"+port, r)
@@ -395,6 +417,8 @@ func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	e.lastStepSignal = time.Now()
+
 	// Send step signal to game loop
 	select {
 	case e.stepChan <- struct{}{}:
@@ -405,6 +429,38 @@ func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		log.Printf("Engine %s step signal already queued", e.nodeID)
 	}
+}
+
+// handleRandomize reseeds the grid with random live cells and resets generation.
+// Called by the web frontend (via controller click-to-randomize) so a user can
+// inject new patterns into a specific grid section.
+func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
+	e.grid.RandomSeed(0.3)
+	log.Printf("Engine %s randomized grid at position %d", e.nodeID, e.position)
+
+	// Push new state immediately so the controller reflects the change promptly
+	go e.pushState()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// detectOwnIP returns the first non-loopback IPv4 address of this host, so
+// the controller can reach this engine's /step and /randomize endpoints.
+// Falls back to "localhost" when nothing usable is found.
+func detectOwnIP() string {
+	interfaceAddrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range interfaceAddrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() {
+				continue
+			}
+			if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+				return ipv4.String()
+			}
+		}
+	}
+	return "localhost"
 }
 
 func main() {

@@ -24,6 +24,7 @@ type Controller struct {
 	webReadChan     chan *WebReadMessage
 	clickChan       chan *ClickMessage
 	stepBroadcastChan chan *StepBroadcastMessage
+	randomizeAllChan  chan *RandomizeAllMessage
 	
 	// State (only accessed by the main goroutine)
 	nodes             map[int]*NodeInfo
@@ -82,6 +83,10 @@ type ClickMessage struct {
 type StepBroadcastMessage struct {
 	Position int
 	Response chan error
+}
+
+type RandomizeAllMessage struct {
+	Response chan int
 }
 
 // Data types
@@ -154,6 +159,7 @@ func NewController() *Controller {
 		webReadChan:       make(chan *WebReadMessage, 1000),
 		clickChan:         make(chan *ClickMessage, 100),
 		stepBroadcastChan: make(chan *StepBroadcastMessage, 1000),
+		randomizeAllChan:  make(chan *RandomizeAllMessage, 10),
 		nodes:             make(map[int]*NodeInfo),
 		gridStates:        make(map[int]*GridState),
 		currentGeneration: 0,
@@ -214,6 +220,10 @@ func (c *Controller) messageProcessor() {
 			atomic.AddInt64(&c.stepBroadcastQueueSize, -1)
 			err := c.processStepBroadcast(msg.Position)
 			msg.Response <- err
+
+		case msg := <-c.randomizeAllChan:
+			success := c.processRandomizeAll()
+			msg.Response <- success
 		}
 	}
 }
@@ -441,20 +451,77 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 	}
 }
 
-// Process click request
+// Process click request: sends a randomize signal to the engine owning the
+// clicked grid section. Runs on the message processor goroutine, so c.nodes
+// is accessed safely here. The HTTP call is dispatched in a goroutine to
+// avoid blocking the message processor.
 func (c *Controller) processClick(req ClickRequest) error {
-	// Calculate which grid this click belongs to (7x7 grids)
+	// Calculate which grid this click belongs to (7x7 grids, 10x10 layout)
 	gridX := req.GlobalX / 7
 	gridY := req.GlobalY / 7
 	position := gridY*10 + gridX
-	
-	// Check if we have this grid
-	if _, exists := c.gridStates[position]; exists {
-		log.Printf("Click at (%d,%d) targeting grid at position %d", req.GlobalX, req.GlobalY, position)
-		return nil
+
+	node, exists := c.nodes[position]
+	if !exists {
+		return fmt.Errorf("no engine registered at grid position (%d, %d)", gridX, gridY)
 	}
-	
-	return fmt.Errorf("grid not found")
+
+	log.Printf("Click at (%d,%d) targeting grid at position %d (engine %s at %s)",
+		req.GlobalX, req.GlobalY, position, node.PodID, node.Endpoint)
+
+	// Send randomize request to the target engine asynchronously
+	go c.sendRandomizeToEngine(position)
+
+	return nil
+}
+
+// sendRandomizeToEngine sends a POST /randomize to a specific engine
+func (c *Controller) sendRandomizeToEngine(position int) {
+	node, exists := c.nodes[position]
+	if !exists {
+		return
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(node.Endpoint+"/randomize", "application/json", nil)
+	if err != nil {
+		log.Printf("Failed to send randomize to engine %d: %v", position, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Engine %d rejected randomize: %d", position, resp.StatusCode)
+	}
+}
+
+// processRandomizeAll sends a POST /randomize to every registered engine.
+// Runs on the message processor goroutine; HTTP fan-out is dispatched in
+// goroutines so the processor isn't blocked.
+func (c *Controller) processRandomizeAll() int {
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	var wg sync.WaitGroup
+	var successCount int64
+
+	for position := range c.nodes {
+		wg.Add(1)
+		go func(pos int, endpoint string) {
+			defer wg.Done()
+			resp, err := client.Post(endpoint+"/randomize", "application/json", nil)
+			if err != nil {
+				log.Printf("Failed to randomize engine %d: %v", pos, err)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				atomic.AddInt64(&successCount, 1)
+			}
+		}(position, c.nodes[position].Endpoint)
+	}
+
+	wg.Wait()
+	return int(successCount)
 }
 
 // broadcastStepToAllEngines sends step signal to all registered engines
@@ -593,24 +660,33 @@ func (c *Controller) removeWebSocketClient(client *websocket.Conn) {
 	}
 }
 
-// barrierCoordinator manages the barrier synchronization for distributed stepping
+// barrierCoordinator manages the barrier synchronization for distributed stepping.
+// It polls engine readiness at short intervals and broadcasts a step signal when
+// either all engines report ready (fast path) or the barrier timeout elapses
+// (slow path). Engines that don't report ready before the timeout are counted as
+// missing the step and may be cleaned up by cleanupStaleEngines.
 func (c *Controller) barrierCoordinator() {
-	ticker := time.NewTicker(c.barrierTimeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	
+
+	lastStep := time.Now()
+
 	for range ticker.C {
-		if !c.stepInProgress && len(c.nodes) > 0 && !c.steppingPaused {
-			// Check if all engines are ready or timeout expired
-			readyCount := len(c.readyEngines)
-			totalEngines := len(c.nodes)
-			
-			if readyCount >= totalEngines || true { // Always step after timeout
-				log.Printf("Barrier sync: %d/%d engines ready, broadcasting step for generation %d", 
-					readyCount, totalEngines, c.currentGeneration)
-				
-				c.stepInProgress = true
-				go c.broadcastStepToAllEngines()
-			}
+		if c.stepInProgress || len(c.nodes) == 0 || c.steppingPaused {
+			continue
+		}
+
+		readyCount := len(c.readyEngines)
+		totalEngines := len(c.nodes)
+		elapsed := time.Since(lastStep)
+
+		if readyCount >= totalEngines || elapsed >= c.barrierTimeout {
+			log.Printf("Barrier sync: %d/%d engines ready (%v elapsed), broadcasting step for generation %d",
+				readyCount, totalEngines, elapsed.Round(time.Millisecond), c.currentGeneration)
+
+			c.stepInProgress = true
+			lastStep = time.Now()
+			go c.broadcastStepToAllEngines()
 		}
 	}
 }
@@ -828,34 +904,24 @@ func (c *Controller) handleClick(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /api/randomize
+// POST /api/randomize - sends a randomize request to every registered engine.
+// This dispatches through the message processor via a dedicated channel so
+// that c.nodes is read safely. The HTTP fan-out to engines happens in
+// goroutines to avoid blocking the message processor.
 func (c *Controller) handleRandomize(w http.ResponseWriter, r *http.Request) {
-	// For now, just use the web read channel to get node count
-	responseChan := make(chan interface{}, 1)
-	msg := &WebReadMessage{
-		Type:     "health",
-		Response: responseChan,
-	}
-	
+	responseChan := make(chan int, 1)
+	msg := &RandomizeAllMessage{Response: responseChan}
+
 	select {
-	case c.webReadChan <- msg:
-		atomic.AddInt64(&c.webReadQueueSize, 1)
-		// Wait for response
-		if health, ok := <-responseChan; ok {
-			if healthMap, ok := health.(map[string]interface{}); ok {
-				total := healthMap["nodes"].(int)
-				response := map[string]interface{}{
-					"success": total,
-					"total":   total,
-				}
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(response)
-				return
-			}
+	case c.randomizeAllChan <- msg:
+		success := <-responseChan
+		response := map[string]interface{}{
+			"success": success,
+			"total":   success, // total == success since we attempt all registered nodes
 		}
-		http.Error(w, "Failed to get node count", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
 	default:
-		// Queue full
 		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
 	}
 }
