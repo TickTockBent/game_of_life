@@ -1,0 +1,59 @@
+# Local Distributed Game of Life
+#
+#   docker compose up -d --build            # controller + web + 3 engines
+#   docker compose up -d --scale engine=9   # grow the grid (max 100)
+#   docker compose logs -f controller
+#   open http://localhost:8090
+#
+# Engines register with the controller, receive a slot in the 10x10 layout,
+# and step in lockstep via barrier sync. Each engine resolves its own IP on the
+# compose network so the controller can push /step and /randomize to it.
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    image: gameoflife-controller:local
+    environment:
+      PORT: "8081"
+    ports:
+      - "${CONTROLLER_HOST_PORT:-8082}:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+    image: gameoflife-engine:local
+    environment:
+      CONTROLLER_URL: "http://controller:8081"
+    depends_on:
+      controller:
+        condition: service_healthy
+    deploy:
+      replicas: ${ENGINE_REPLICAS:-3}
+      resources:
+        limits:
+          memory: 64M
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: gameoflife-web:local
+    environment:
+      PORT: "8080"
+      CONTROLLER_URL: "http://controller:8081"
+    ports:
+      - "${WEB_HOST_PORT:-8090}:8080"
+    depends_on:
+      controller:
+        condition: service_healthy
+    restart: unless-stopped

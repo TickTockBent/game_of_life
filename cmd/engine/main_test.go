@@ -1,238 +1,150 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	
+
 	"github.com/gorilla/mux"
 )
 
 func setupTestEngine() (*Engine, *mux.Router) {
 	engine := NewEngine()
-	
+
 	router := mux.NewRouter()
-	router.HandleFunc("/state", engine.handleGetState).Methods("GET")
-	router.HandleFunc("/cell", engine.handleUpdateCell).Methods("POST")
-	router.HandleFunc("/start", engine.handleStart).Methods("POST")
-	router.HandleFunc("/stop", engine.handleStop).Methods("POST")
+	router.HandleFunc("/health", engine.handleHealth).Methods("GET")
 	router.HandleFunc("/step", engine.handleStep).Methods("POST")
 	router.HandleFunc("/randomize", engine.handleRandomize).Methods("POST")
-	router.HandleFunc("/health", engine.handleHealth).Methods("GET")
-	
+
 	return engine, router
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	_, router := setupTestEngine()
-	
+	engine, router := setupTestEngine()
+
 	req, _ := http.NewRequest("GET", "/health", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
-	
+
 	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", recorder.Code)
+		t.Fatalf("Expected status 200, got %d", recorder.Code)
 	}
-	
+
 	var health map[string]interface{}
-	err := json.NewDecoder(recorder.Body).Decode(&health)
-	if err != nil {
+	if err := json.NewDecoder(recorder.Body).Decode(&health); err != nil {
 		t.Fatal("Failed to decode health response:", err)
 	}
-	
+
 	if health["status"] != "healthy" {
 		t.Errorf("Expected status 'healthy', got %v", health["status"])
 	}
+	if health["nodeId"] != engine.nodeID {
+		t.Errorf("Expected nodeId '%s', got %v", engine.nodeID, health["nodeId"])
+	}
+	if health["registered"] != false {
+		t.Error("Expected registered=false for new engine")
+	}
+	if health["position"].(float64) != -1 {
+		t.Errorf("Expected position -1 for unregistered engine, got %v", health["position"])
+	}
 }
 
-func TestGetStateEndpoint(t *testing.T) {
+func TestStepWhenUnregistered(t *testing.T) {
 	_, router := setupTestEngine()
-	
-	req, _ := http.NewRequest("GET", "/state", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", recorder.Code)
-	}
-	
-	var response GridStateResponse
-	err := json.NewDecoder(recorder.Body).Decode(&response)
-	if err != nil {
-		t.Fatal("Failed to decode state response:", err)
-	}
-	
-	if response.Generation != 0 {
-		t.Errorf("Expected initial generation 0, got %d", response.Generation)
-	}
-	
-	if len(response.Grid) != 7 {
-		t.Errorf("Expected 7x7 grid, got %d rows", len(response.Grid))
-	}
-	
-	if len(response.Edges) != 4 {
-		t.Errorf("Expected 4 edges, got %d", len(response.Edges))
-	}
-}
 
-func TestUpdateCellEndpoint(t *testing.T) {
-	engine, router := setupTestEngine()
-	
-	cellUpdate := CellUpdateRequest{
-		X:     3,
-		Y:     3,
-		Alive: true,
-	}
-	
-	jsonBody, _ := json.Marshal(cellUpdate)
-	req, _ := http.NewRequest("POST", "/cell", bytes.NewBuffer(jsonBody))
-	req.Header.Set("Content-Type", "application/json")
-	
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", recorder.Code)
-	}
-	
-	// Verify cell was updated
-	if !engine.grid.GetCell(3, 3) {
-		t.Error("Cell was not updated")
-	}
-}
-
-func TestStepEndpoint(t *testing.T) {
-	engine, router := setupTestEngine()
-	
-	initialGeneration := engine.grid.GetGeneration()
-	
 	req, _ := http.NewRequest("POST", "/step", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", recorder.Code)
-	}
-	
-	newGeneration := engine.grid.GetGeneration()
-	if newGeneration != initialGeneration+1 {
-		t.Errorf("Expected generation %d, got %d", initialGeneration+1, newGeneration)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status 503 for step when unregistered, got %d", recorder.Code)
 	}
 }
 
-func TestStartStopEndpoints(t *testing.T) {
+func TestStepWhenRegistered(t *testing.T) {
 	engine, router := setupTestEngine()
-	
-	// Test start
-	req, _ := http.NewRequest("POST", "/start", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200 for start, got %d", recorder.Code)
-	}
-	
-	if !engine.running {
-		t.Error("Engine should be running after start")
-	}
-	
-	// Test start when already running
-	req, _ = http.NewRequest("POST", "/start", nil)
-	recorder = httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400 for duplicate start, got %d", recorder.Code)
-	}
-	
-	// Test stop
-	req, _ = http.NewRequest("POST", "/stop", nil)
-	recorder = httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200 for stop, got %d", recorder.Code)
-	}
-	
-	if engine.running {
-		t.Error("Engine should not be running after stop")
-	}
-	
-	// Test stop when already stopped
-	req, _ = http.NewRequest("POST", "/stop", nil)
-	recorder = httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400 for duplicate stop, got %d", recorder.Code)
-	}
-}
 
-func TestStepWhileRunning(t *testing.T) {
-	engine, router := setupTestEngine()
-	
-	// Start the engine
-	engine.running = true
-	
+	// Simulate successful registration
+	engine.registered = true
+	engine.position = 0
+
 	req, _ := http.NewRequest("POST", "/step", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400 for step while running, got %d", recorder.Code)
+
+	if recorder.Code != http.StatusOK {
+		t.Errorf("Expected status 200 for step when registered, got %d", recorder.Code)
+	}
+
+	// Verify the step signal was queued on the step channel
+	select {
+	case <-engine.stepChan:
+		// Step signal received - expected
+	default:
+		t.Error("Expected step signal to be queued on stepChan")
+	}
+}
+
+func TestStepChannelFull(t *testing.T) {
+	engine, router := setupTestEngine()
+	engine.registered = true
+	engine.position = 0
+
+	// Fill the step channel (capacity is 10)
+	for i := 0; i < 10; i++ {
+		engine.stepChan <- struct{}{}
+	}
+
+	// Now step should still return 200 (drops the signal gracefully)
+	req, _ := http.NewRequest("POST", "/step", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Errorf("Expected status 200 when step channel is full, got %d", recorder.Code)
 	}
 }
 
 func TestRandomizeEndpoint(t *testing.T) {
 	engine, router := setupTestEngine()
-	
-	// Set generation to non-zero
+
+	// Advance generation to non-zero
 	engine.grid.NextGeneration()
 	engine.grid.NextGeneration()
-	
+	initialGen := engine.grid.GetGeneration()
+	if initialGen != 2 {
+		t.Fatalf("Expected generation 2 before randomize, got %d", initialGen)
+	}
+
 	req, _ := http.NewRequest("POST", "/randomize", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
-	
+
 	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", recorder.Code)
+		t.Errorf("Expected status 200 for randomize, got %d", recorder.Code)
 	}
-	
-	// Check that generation was reset
+
+	// Randomize should reset generation to 0
 	if engine.grid.GetGeneration() != 0 {
-		t.Error("Randomize should reset generation to 0")
+		t.Errorf("Expected generation 0 after randomize, got %d", engine.grid.GetGeneration())
 	}
-	
+
 	// Check that at least some cells are alive
 	state, _ := engine.grid.GetState()
 	hasAliveCell := false
-	for rowIndex := 0; rowIndex < len(state); rowIndex++ {
-		for colIndex := 0; colIndex < len(state[rowIndex]); colIndex++ {
-			if state[rowIndex][colIndex] {
+	for row := range state {
+		for col := range state[row] {
+			if state[row][col] {
 				hasAliveCell = true
 				break
 			}
 		}
+		if hasAliveCell {
+			break
+		}
 	}
-	
 	if !hasAliveCell {
 		t.Error("Randomize should create at least some alive cells")
-	}
-}
-
-func TestInvalidCellUpdate(t *testing.T) {
-	_, router := setupTestEngine()
-	
-	// Test invalid JSON
-	req, _ := http.NewRequest("POST", "/cell", bytes.NewBufferString("invalid json"))
-	req.Header.Set("Content-Type", "application/json")
-	
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-	
-	if recorder.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400 for invalid JSON, got %d", recorder.Code)
 	}
 }

@@ -62,3 +62,22 @@ deploy-fresh: registry-auth deploy
 local-test:
 	@echo "Starting local test server..."
 	PORT=8080 NODE_NAME=local go run cmd/engine/main.go
+# --- Local docker compose stack (current deployment path) -------------------
+ENGINES ?= 3
+
+.PHONY: up down scale logs status
+up:            ## Build and start controller + web + $(ENGINES) engines
+	docker compose up -d --build --scale engine=$(ENGINES)
+
+down:          ## Stop and remove the local stack
+	docker compose down
+
+scale:         ## Change engine count: make scale ENGINES=9
+	docker compose up -d --no-recreate --scale engine=$(ENGINES)
+
+logs:          ## Tail controller logs
+	docker compose logs -f controller
+
+status:        ## Show controller health and running containers
+	@curl -s localhost:$${CONTROLLER_HOST_PORT:-8082}/health; echo
+	@docker compose ps
