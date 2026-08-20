@@ -1,121 +1,57 @@
 # Distributed Conway's Game of Life
 
-A distributed implementation of Conway's Game of Life running on Kubernetes, demonstrating distributed computing concepts with real-time visualization.
+Conway's Game of Life split across many independent engine processes, kept in lockstep by a
+central controller, with a real-time web view showing which engine owns which part of the grid.
 
-## Current Status
+Live: **https://gameoflife.wshoffner.dev**
 
-✅ **Core Components Implemented:**
-- Game engine with REST API
-- Controller service for aggregation
-- Web frontend with basic visualization
-- Kubernetes manifests (DaemonSet, Services, Ingress)
-- Docker registry integration at registry.ticktockbent.com
-- Vault-based authentication for image pulls
+## How it works
 
-🚧 **In Progress:**
-- Debugging pod crashes in initial deployment
-- Border synchronization between nodes
-- Real-time WebSocket updates
-- Interactive scaling controls
+- **Engine** — owns one 7×7 section of the grid. Registers with the controller, gets assigned a
+  slot in a 10×10 layout (so up to 100 engines / a 70×70 field), and then only acts when told to
+  step. Before each step it fetches a one-cell *halo* of its neighbours' border cells from the
+  controller, so patterns cross section boundaries as if it were one grid. Engines never talk to
+  each other.
+- **Controller** — single coordinator, channel-based (no locks). Aggregates state, serves halos,
+  and runs **barrier synchronization**: it broadcasts `POST /step` to every engine once all have
+  reported the previous generation, or after a 1s timeout. Engines that miss 3 steps are dropped;
+  engines that hear nothing for 10s re-register. Streams state to the web tier over WebSocket.
+- **Web** — serves the canvas UI and proxies `/api/*` and `/ws` to the controller. The controller
+  itself is never exposed publicly.
 
-## Quick Start
-
-### Prerequisites
-- Kubernetes cluster (k3s/k8s)
-- Docker
-- Go 1.21+
-- Access to Vault for registry authentication
-- kubectl configured for your cluster
-
-### Deployment
+## Running it
 
 ```bash
-# Ensure Vault authentication is configured
-export VAULT_ADDR='http://127.0.0.1:8200'
-vault login  # if needed
-
-# Deploy everything (builds, pushes, and deploys)
-make deploy
+make up ENGINES=3      # build + start controller, web, 3 engines
+make scale ENGINES=9   # add/remove engines live — the grid grows/shrinks
+make status            # controller health + containers
+make logs              # controller log (watch the barrier sync)
+make down
 ```
 
-This will:
-1. Set up registry authentication via Vault
-2. Build all Docker images
-3. Push to registry.ticktockbent.com
-4. Deploy to your Kubernetes cluster
+Web UI on http://localhost:8090, controller API on http://localhost:8082. Override host ports with
+`WEB_HOST_PORT` / `CONTROLLER_HOST_PORT`.
 
-### Manual Steps
+Requirements: Docker with Compose v2. Go 1.22 only if you want to build or test outside Docker
+(`go build ./... && go test ./...`).
 
-```bash
-# Build binaries
-make build
-
-# Build Docker images
-make docker-build
-
-# Push to registry
-make docker-push
-
-# Set up authentication only
-make setup-auth
-
-# Deploy to cluster
-kubectl apply -f manifests/
-```
-
-### Development
-
-```bash
-# Run local test
-make local-test
-
-# Run tests
-make test
-
-# Check deployment status
-kubectl get pods -n gameoflife
-kubectl logs -f -n gameoflife deployment/gameoflife-controller
-```
-
-## Architecture
-
-- **Game Engine** (DaemonSet): One pod per node computing grid sections
-- **Controller**: Aggregates data from engines and handles user interactions
-- **Web Frontend**: Interactive visualization and controls
-- **Registry**: Private Docker registry with Vault authentication
-
-## Project Structure
+## Layout
 
 ```
-.
-├── cmd/                    # Application entrypoints
-│   ├── engine/            # Game engine service
-│   ├── controller/        # Controller service
-│   └── web/              # Web frontend server
-├── pkg/                   # Shared packages
-│   ├── gameoflife/       # Core game logic
-│   ├── grid/             # Grid management
-│   ├── controller/       # Controller logic
-│   └── api/              # API models
-├── web/                   # Frontend assets
-│   └── public/           # Static files
-├── manifests/            # Kubernetes YAML
-├── scripts/              # Helper scripts
-└── documentation/        # Project docs
+cmd/controller/   coordinator (barrier sync, halo service, WebSocket fan-out)
+cmd/engine/       grid-section worker
+cmd/web/          static UI + reverse proxy to controller
+cmd/public-engine/ standalone engine for joining a remote controller (see README.public-engine.md)
+pkg/gameoflife/   core Life rules and 7x7 grid with halo support
+web/public/       canvas frontend
+manifests/        historical Kubernetes manifests (see below)
 ```
 
-## Troubleshooting
+## History
 
-### Image Pull Issues
-- Ensure registry secret exists: `kubectl get secret registry-secret -n gameoflife`
-- Re-run authentication: `make setup-auth`
-- Check Vault connectivity: `vault status`
-
-### Pod Crashes
-- Check logs: `kubectl logs -n gameoflife <pod-name>`
-- Verify environment variables in manifests
-- Ensure services are accessible within cluster
-
-## Contributing
-
-See [CLAUDE.md](./CLAUDE.md) for development guidelines and project conventions.
+This originally ran as a K3s DaemonSet across several physical nodes (ARM and x86), with a
+private registry and a Cloudflare tunnel — the web copy about "a different pod on a different
+physical node" dates from then. That cluster was retired in 2026; the `manifests/` directory and
+the registry-based Makefile targets are kept for reference but are not maintained. Nothing in the
+code assumes engines share a machine, so it could go back to a multi-host deployment by pointing
+`CONTROLLER_URL` at a reachable controller.
