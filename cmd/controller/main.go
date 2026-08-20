@@ -149,7 +149,7 @@ type HaloResponse struct {
 func NewController() *Controller {
 	regionID := os.Getenv("REGION_ID")
 	if regionID == "" {
-		regionID = "k3s-cluster"
+		regionID = "local"
 	}
 
 	c := &Controller{
