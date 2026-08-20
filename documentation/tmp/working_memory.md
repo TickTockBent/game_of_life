@@ -22,7 +22,7 @@
 - `SIMPLIFIED_ARCHITECTURE.md` describes a no-barrier-sync design that contradicts the code.
 - `HANDOFF_SESSION.md` is from July 2025.
 - Most Go files are not gofmt'd.
-- `regionId` defaults to "k3s-cluster" (REGION_ID env) — cosmetic.
+- Running 10 engines as of 2026-08-20 (`make scale ENGINES=10`). REGION_ID now "motherbrain" via compose.
 
 ### Public exposure (2026-08-20)
 - https://gameoflife.wshoffner.dev → `cloudflared-gameoflife.service` → web `:8090` (tunnel
