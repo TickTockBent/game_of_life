@@ -258,6 +258,10 @@ make status / logs / down
 - Controller API: http://localhost:8082 (container port 8081). Admin surface (`/debug/*`,
   `/api/randomize`) is on container port 8091, **not published**:
   `docker compose exec controller wget -qO- --post-data= http://localhost:8091/debug/pause`
+- Controller public port is also reachable at https://gameoflife-api.wshoffner.dev (same tunnel).
+  Public-engine limits: `MAX_ENGINES_PER_IP` (2, keyed on `CF-Connecting-IP`), `RESERVED_HOUSE_SLOTS`
+  (10), `SILENT_THRESHOLD` (240 missed ≈ 60s before a connected-but-silent engine is dropped;
+  `STALE_THRESHOLD` 40 ≈ 10s applies once the socket is actually gone).
 - Tuning env on the controller: `STEP_INTERVAL` (250ms → 4 gen/s), `BARRIER_TIMEOUT` (1s),
   `LAG_THRESHOLD` (2 missed steps → `lagging: true`, excluded from barrier), `STALE_THRESHOLD`
   (40 missed → removed). Slots are assigned centre-out so engines form a blob, not a strip.

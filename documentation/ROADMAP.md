@@ -70,7 +70,7 @@ Each phase is independently shippable and leaves the public page working.
   cap, protocol version handshake. Deleted: `cmd/public-engine`, `cmd/router`, `pkg/grid`,
   `pkg/controller`, `bin/`, `*.optimized`, `SIMPLIFIED_ARCHITECTURE.md`, `README.public-engine.md`.
 
-### Phase D — Public API surface
+### Phase D — Public API surface ✅ shipped 2026-08-21
 - Second tunnel ingress: `gameoflife-api.wshoffner.dev → localhost:8082` (same `gameservers`
   tunnel, same systemd unit). Cloudflare WS passthrough is on by default; engine pings every 30 s
   to stay under the 100 s idle cut.
