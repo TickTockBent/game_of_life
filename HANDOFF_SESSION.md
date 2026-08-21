@@ -1,56 +1,59 @@
 # Session Handoff
 
-## Where we stopped (2026-08-20, HEAD `aabc44a`)
+## Where we stopped (2026-08-21, HEAD `339553b`, tag `v1.0.0`, pushed to origin/main)
 
-The project was revived after the lab move. It now runs as a **docker compose stack on
-motherbrain** and is publicly visible at **https://gameoflife.wshoffner.dev**. Working tree clean,
-all work committed on `main`.
+All five roadmap phases are shipped and running:
 
-**Running right now:** controller + web + **10 engines**, stepping ~15 gen/s, `REGION_ID=motherbrain`.
-`restart: unless-stopped`, so it survives reboots. `cloudflared-gameoflife.service` (tunnel
-`gameservers`, UUID `f0539d6a…`) fronts the web container only; the controller API is not public.
+- **A** controller groundwork: spiral slots, fixed 4 gen/s tick, soft-skip laggards, admin port 8091
+- **B** UI: "Plotter" design at `/` (graph paper drawn on the cell lattice, color-by-engine OFF by
+  default with a toggle, light/dark), `/stats.html` nerd stats, `/classic/` old UI, `/themes/` candidates
+- **C** engines dial the controller over ONE WebSocket (`/engine`); halo rides in the step message
+  (corners fixed); pattern-based reseed; HTTP push, router, public-engine, pkg/grid deleted
+- **D** `gameoflife-api.wshoffner.dev` → controller public port via the existing tunnel; per-IP cap,
+  reserved house slots, rate cap, IPs hidden, two-tier eject budget
+- **E** GHCR multi-arch images via GitHub Actions; Join panel on the page; README leads with joining
+
+**Running right now:** controller + web + 10 engines on motherbrain (compose, `restart: unless-stopped`),
+public at https://gameoflife.wshoffner.dev, engine API at https://gameoflife-api.wshoffner.dev.
+
+## The one thing blocking "anyone can join"
+
+The GHCR package is **private** (inherited from the repo). No API for this — one click in the UI:
+https://github.com/users/TickTockBent/packages/container/gameoflife-engine/settings → Change visibility → Public.
+Then from any machine: `docker run -d --name life -e DISPLAY_NAME="me" ghcr.io/ticktockbent/gameoflife-engine`.
 
 ## How to resume
 
 ```bash
 cd ~/projects/infrastructure/game_of_life
-make status                      # controller health + containers
-systemctl status cloudflared-gameoflife
-cat documentation/ROADMAP.md     # the agreed path forward
+make status                              # controller health + containers
+systemctl status cloudflared-gameoflife  # tunnel (both hostnames)
+cat documentation/tmp/working_memory.md  # latest findings
+gh run list --limit 3                    # image builds
 ```
 
-If the stack is down: `make up ENGINES=10`. If the public page is down but local works:
-`sudo systemctl restart cloudflared-gameoflife`.
+Stack down → `make up ENGINES=10`. Public page down but local fine → `sudo systemctl restart cloudflared-gameoflife`.
+Pause/step/reseed-all: `docker compose exec controller wget -qO- --post-data= http://localhost:8091/debug/pause` (admin port, container-only).
+**After any JS/CSS change bump the `?v=` in the HTML** — Cloudflare edge-caches by extension for 4 h.
 
-## What's next
+## Wes's testing notes (what to look for)
 
-`documentation/ROADMAP.md` lays out phases A–E (controller groundwork → UI rebuild → WS engine
-transport → public API → GHCR + "Join" panel). **Two decisions are pending before Phase A/E:**
+- Join from outside the LAN (phone hotspot): should appear within seconds, hover shows the name,
+  `/stats.html` lists it as `public`. A third engine from the same address is refused.
+- Kill the laptop's Wi-Fi for 30 s: section dims (lagging), slot is held, catches up on return.
+- If something misbehaves: `docker compose logs -f controller` — every register/refuse/lag/eject is logged.
 
-1. Step cadence — roadmap proposes a fixed ~4 gen/s (`STEP_INTERVAL`); faster looks livelier,
-   slower is kinder to remote engines.
-2. Join panel — collect display name only, or also an optional free-text location label?
+## Loose ends / next
 
-Start with Phase A (spiral slot packing, fixed tick, miss budget, admin-port split); it improves
-the public page immediately without touching the protocol.
-
-## Loose ends
-
-- **Cleanup not done:** `cmd/router/`, `Dockerfile.router`, `manifests/router-deployment.yaml`,
-  four `Dockerfile.*.optimized`, loose `./controller` + `./engine` binaries and `bin/`,
-  `SIMPLIFIED_ARCHITECTURE.md` (describes a no-barrier design that contradicts the code),
-  `README.public-engine.md` (describes the NAT-broken push model). Most Go files are not gofmt'd.
-  Roadmap Phase C deletes most of this.
-- **`cmd/public-engine` is not usable by outsiders** — the controller pushes `/step` to engines,
-  so participants must be inbound-reachable; its IP auto-detection returns the LAN address.
-  Roadmap D1–D3 replaces it. Don't advertise the one-liner until Phase E.
-- **Tunnel is still named `gameservers`** in Cloudflare; rename to `gameoflife` in the dashboard
-  (no CLI rename). Notebook carries the TODO.
-- **10 engines render as a 70×7 strip** (linear slot assignment) — Phase A fixes.
-- `manifests/` and registry Makefile targets are historical; kept for reference only.
+- **Phase F (hardening)**: Prometheus metrics on the admin port (scrape from the lab stack), per-engine
+  latency in the participants list, optional join token if abuse shows up.
+- gen/s sparkline is still just a number.
+- `/metrics` is public (web proxies it); harmless but revisit.
+- Rename tunnel `gameservers` → `gameoflife` in the Cloudflare dashboard (cosmetic).
+- Optionally set the zone's Browser Cache TTL to "Respect existing headers" and drop the `?v=` dance.
+- `scripts/` and `manifests/` are still the historical K3s set — untouched, could be pruned.
 
 ## Lab notebook
 
-`~/homelab/external-access.md` and `services.md` were updated this session (tunnel table row,
-compose project entry, corrected the previously-wrong "orphaned credential" story). They match
-reality as of this commit.
+`~/homelab/external-access.md` (both hostnames, tunnel row, edge-cache gotcha) and `services.md`
+(compose entry) were updated this session and match reality.
