@@ -406,6 +406,10 @@ func main() {
 
 	r := mux.NewRouter()
 
+	// Theme previews (design candidates for the UI rebuild)
+	r.PathPrefix("/themes/").Handler(http.StripPrefix("/themes/",
+		http.FileServer(http.Dir("static/public/themes/"))))
+
 	// Serve static files
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", 
 		http.FileServer(http.Dir("static/public/"))))
