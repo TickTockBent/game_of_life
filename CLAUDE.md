@@ -254,7 +254,7 @@ make scale ENGINES=9   # grow the grid (up to 100 positions in the 10x10 layout)
 make status / logs / down
 ```
 
-- Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain), public at https://gameoflife.wshoffner.dev via `cloudflared-gameoflife.service`
+- Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain), public at https://gameoflife.wshoffner.dev via `cloudflared-gameoflife.service`. Main page is the Plotter design; `/stats.html` = nerd stats + reseed-all; `/themes/` = design candidates; `/classic/` = old UI. Static assets carry `?v=` — **bump it on every JS/CSS change**, Cloudflare edge-caches by extension for 4 h.
 - Controller API: http://localhost:8082 (container port 8081). Admin surface (`/debug/*`,
   `/api/randomize`) is on container port 8091, **not published**:
   `docker compose exec controller wget -qO- --post-data= http://localhost:8091/debug/pause`

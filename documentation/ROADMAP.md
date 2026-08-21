@@ -38,7 +38,7 @@ Each phase is independently shippable and leaves the public page working.
   no longer drags the grid to 1 gen/s. `/metrics` stayed public because the web tier proxies it;
   revisit in Phase D.
 
-### Phase B — UI rebuild (`web/public/`, still vanilla JS + canvas, no build step)
+### Phase B — UI rebuild (`web/public/`, still vanilla JS + canvas, no build step) ✅ shipped 2026-08-21 (Plotter direction)
 - Layout: grid is the hero, full-bleed, canvas scales to viewport (devicePixelRatio-aware).
 - Cells tinted per owner (stable hash of engine ID → hue; light/dark variants); section borders as
   faint hairlines; **no text on the canvas**. Hover/tap a section → floating card with owner name,
@@ -49,6 +49,11 @@ Each phase is independently shippable and leaves the public page working.
 - Retire the raw queue-size tiles; keep them behind a "nerd stats" disclosure.
 - Empty slots rendered as subtle dotted outlines so a growing grid reads as "room to join".
 - **Exit:** looks intentional on phone + desktop in both themes; no node IDs over the grid.
+- *Shipped:* `/` is the Plotter design (graph paper drawn on the cell lattice, full-bleed canvas,
+  stats rail). **Colour-by-engine is off by default** (single ink), toggle in header, persisted;
+  `?color=1`/`?theme=dark` URL overrides. Nerd stats + reseed-all live at `/stats.html`; the old UI is
+  parked at `/classic/`; the four design candidates remain at `/themes/`. Renderer is
+  `web/public/life-core.js`. Not done: gen/s sparkline (number only), per-engine latency.
 
 ### Phase C — WebSocket engine transport (D1–D3)
 - Controller: `/engine` WS handler → `hello{displayName, version}` / `assigned{position}` /

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Game of Life</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='2' height='2' x='1' y='1' fill='%23000'/><rect width='2' height='2' x='5' y='1' fill='%23000'/><rect width='2' height='2' x='9' y='1' fill='%23000'/><rect width='2' height='2' x='13' y='1' fill='%23000'/><rect width='2' height='2' x='1' y='5' fill='%23000'/><rect width='2' height='2' x='9' y='5' fill='%23000'/><rect width='2' height='2' x='1' y='9' fill='%23000'/><rect width='2' height='2' x='5' y='9' fill='%23000'/><rect width='2' height='2' x='13' y='9' fill='%23000'/><rect width='2' height='2' x='5' y='13' fill='%23000'/><rect width='2' height='2' x='9' y='13' fill='%23000'/></svg>">"
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
+        
+        .canvas-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        
+        #gameCanvas {
+            border: 2px solid #333;
+            background-color: white;
+        }
+        
+        .status {
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        
+        .status-item {
+            background-color: white;
+            padding: 10px;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            min-width: 150px;
+            text-align: center;
+        }
+        
+        .status-item h3 {
+            margin: 0 0 5px 0;
+            color: #333;
+        }
+        
+        .status-item p {
+            margin: 0;
+            font-size: 18px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        
+        .node-info {
+            margin-top: 20px;
+            background-color: white;
+            padding: 15px;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .node-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .node-card {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+        
+        .node-card.arm64 {
+            border-left-color: #28a745;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Distributed Conway's Game of Life</h1>
+            <p>Each grid section is computed by a separate engine process, kept in lockstep by a central controller</p>
+        </div>
+        
+        
+        <div class="canvas-container">
+            <canvas id="gameCanvas" width="700" height="700"></canvas>
+        </div>
+        
+        <div class="status">
+            <div class="status-item">
+                <h3>Connection</h3>
+                <p id="connectionStatus">Connecting...</p>
+            </div>
+            <div class="status-item">
+                <h3>Active Nodes</h3>
+                <p id="nodeCount">-</p>
+            </div>
+            <div class="status-item">
+                <h3>Region ID</h3>
+                <p id="regionId">-</p>
+            </div>
+            <div class="status-item">
+                <h3>Grid Size</h3>
+                <p id="gridSize">-</p>
+            </div>
+            <div class="status-item">
+                <h3>Total Cells</h3>
+                <p id="totalCells">-</p>
+            </div>
+            <div class="status-item">
+                <h3>Last Update</h3>
+                <p id="lastUpdate">-</p>
+            </div>
+        </div>
+        
+        <div class="node-info">
+            <h3>What You're Seeing</h3>
+            <p style="margin: 10px 0; line-height: 1.6; color: #555;">
+                This is <strong>Conway's Game of Life</strong> split across a set of independent engine
+                containers. Each colored section of the grid is owned by one engine, which computes only its
+                own 7&times;7 cells. Engines never talk to each other: before every step each one asks the
+                controller for a one-cell &ldquo;halo&rdquo; of its neighbours&rsquo; border cells, so patterns
+                flow seamlessly across section boundaries as if it were one grid.
+                A central controller uses <strong>barrier synchronization</strong> to keep every engine on the
+                same generation &mdash; it broadcasts a step only once all engines have reported in (or a
+                one-second timeout expires). Engines can be added or removed at any time; the grid simply
+                grows or shrinks. It currently runs as a Docker Compose stack on a single home-lab server,
+                but the same code ran across a multi-node Kubernetes cluster, and nothing in the design
+                assumes the engines share a machine.
+            </p>
+        </div>
+        
+        <div class="node-info">
+            <h3>System Metrics</h3>
+            <div class="status">
+                <div class="status-item">
+                    <h3>Node Ready</h3>
+                    <p id="nodeReady">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Current Generation</h3>
+                    <p id="controllerLoad">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Registered Nodes</h3>
+                    <p id="forceSteps">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Active Grids</h3>
+                    <p id="reregistrations">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Last Update</h3>
+                    <p id="lastStep">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Total Queue Size</h3>
+                    <p id="queueSize">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Register Queue</h3>
+                    <p id="registerQueue">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>State Update Queue</h3>
+                    <p id="stateQueue">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Halo Read Queue</h3>
+                    <p id="haloQueue">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Web Read Queue</h3>
+                    <p id="webQueue">-</p>
+                </div>
+                <div class="status-item">
+                    <h3>Step Broadcast Queue</h3>
+                    <p id="stepQueue">-</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="node-info">
+            <h3>Active Nodes</h3>
+            <div id="nodeGrid" class="node-grid">
+                <!-- Node cards will be populated here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/classic/game.js"></script>
+</body>
+</html>

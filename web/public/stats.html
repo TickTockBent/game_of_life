@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Details · Distributed Life</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css?v=3">
+</head>
+<body class="stats-page">
+<header>
+  <h1>Distributed Life</h1>
+  <span class="sub">details</span>
+  <span class="spacer"></span>
+  <nav>
+    <button id="themeToggle" type="button" class="ctl">Light / dark</button>
+    <a class="ctl" href="/">← Grid</a>
+  </nav>
+</header>
+<main>
+  <h2>Controller</h2>
+  <div class="tiles" id="tiles"></div>
+  <h2>Engines</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Engine</th><th>Slot</th><th>Generation</th><th>Missed steps</th><th>State</th><th>Joined</th><th>Endpoint</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <div class="actions">
+    <button id="reseed" type="button" class="ctl">Reseed every engine</button>
+    <span class="msg" id="msg"></span>
+  </div>
+</main>
+<script>
+(function(){
+  const THEME_KEY='gol-theme', root=document.documentElement;
+  const theme=()=>root.dataset.theme||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+  const apply=()=>root.classList.toggle('is-dark',theme()==='dark');
+  try{const s=localStorage.getItem(THEME_KEY); if(s) root.dataset.theme=s;}catch(e){}
+  const forced=new URLSearchParams(location.search).get('theme'); if(forced==='dark'||forced==='light') root.dataset.theme=forced;
+  apply();
+  document.getElementById('themeToggle').onclick=()=>{root.dataset.theme=theme()==='dark'?'light':'dark'; try{localStorage.setItem(THEME_KEY,root.dataset.theme)}catch(e){} apply();};
+
+  const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const ago=iso=>{const s=(Date.now()-new Date(iso))/1000; return s<60?'just now':s<3600?Math.floor(s/60)+' min ago':s<86400?Math.floor(s/3600)+' h ago':Math.floor(s/86400)+' d ago';};
+  const tile=(v,l,cls='')=>`<div class="tile"><b class="${cls}">${v}</b><span>${l}</span></div>`;
+
+  async function refresh(){
+    try{
+      const [mm,t,g]=await Promise.all([fetch('/api/metrics').then(r=>r.json()),fetch('/api/topology').then(r=>r.json()),fetch('/api/grid').then(r=>r.json())]);
+      const m=mm.controller||mm;
+      document.getElementById('tiles').innerHTML=
+        tile(Number(m.generation).toLocaleString(),'generation')+tile(m.nodes,'engines')+tile(m.activeGrids,'active grids')+
+        tile(esc(m.regionId),'region','txt')+tile(m.regQueueSize,'register queue')+tile(m.stateQueueSize,'state queue')+
+        tile(m.haloQueueSize,'halo queue')+tile(m.webQueueSize,'web queue')+tile(m.stepQueueSize,'step queue');
+      const nodes=Object.entries(t.nodes||{}).sort((a,b)=>Number(a[0])-Number(b[0]));
+      document.getElementById('rows').innerHTML=nodes.map(([pos,n])=>{
+        const gen=(g.grids&&g.grids[pos]&&g.grids[pos].generation)||0;
+        return `<tr class="${n.lagging?'lag':''}"><td>${esc(n.displayName||n.podId)}</td><td>${n.position.row},${n.position.col}</td><td>${gen.toLocaleString()}</td><td>${n.missedSteps}</td><td>${n.lagging?'catching up':'in step'}</td><td>${ago(n.registeredAt)}</td><td>${esc(n.endpoint)}</td></tr>`;
+      }).join('')||'<tr><td colspan="7">No engines registered.</td></tr>';
+    }catch(e){ document.getElementById('msg').textContent='Controller unreachable.'; }
+  }
+  refresh(); setInterval(refresh,2000);
+
+  document.getElementById('reseed').onclick=async()=>{
+    const msg=document.getElementById('msg'); msg.textContent='Reseeding…';
+    try{const r=await fetch('/api/randomize',{method:'POST'}); const j=await r.json(); msg.textContent=`Reseeded ${j.success??'?'} of ${j.total??'?'} engines.`;}
+    catch(e){msg.textContent='Reseed failed.';}
+  };
+})();
+</script>
+</body>
+</html>
