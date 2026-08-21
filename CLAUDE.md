@@ -255,7 +255,12 @@ make status / logs / down
 ```
 
 - Web UI: http://localhost:8090 (host port 8080 is taken by another service on motherbrain), public at https://gameoflife.wshoffner.dev via `cloudflared-gameoflife.service`
-- Controller API: http://localhost:8082 (container port 8081)
+- Controller API: http://localhost:8082 (container port 8081). Admin surface (`/debug/*`,
+  `/api/randomize`) is on container port 8091, **not published**:
+  `docker compose exec controller wget -qO- --post-data= http://localhost:8091/debug/pause`
+- Tuning env on the controller: `STEP_INTERVAL` (250ms → 4 gen/s), `BARRIER_TIMEOUT` (1s),
+  `LAG_THRESHOLD` (2 missed steps → `lagging: true`, excluded from barrier), `STALE_THRESHOLD`
+  (40 missed → removed). Slots are assigned centre-out so engines form a blob, not a strip.
 - Engines have no host ports; the controller reaches them on the compose network. The engine
   derives its node ID from the container hostname and its endpoint from its own interface IP
   when `POD_NAME`/`POD_IP` are absent, so `--scale` just works.

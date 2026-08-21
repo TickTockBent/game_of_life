@@ -1,6 +1,8 @@
 package main
 
 import (
+	"math"
+	"sort"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -36,6 +38,10 @@ type Controller struct {
 	readyEngines      map[int]bool  // tracks which engines are ready for current generation
 	stepInProgress    bool          // true when step broadcast is in progress
 	barrierTimeout    time.Duration // timeout for waiting for all engines
+	stepInterval      time.Duration // minimum time between steps (fixed tick)
+	lagThreshold      int           // missed steps before an engine is flagged lagging
+	staleThreshold    int           // missed steps before an engine is removed
+	slotOrder         []int         // slot assignment order (centre-out spiral)
 	
 	// Debug controls
 	steppingPaused    bool          // When true, barrier coordinator won't auto-step
@@ -98,6 +104,7 @@ type NodeInfo struct {
 	RegisteredAt  time.Time `json:"registeredAt"`
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
 	MissedSteps   int       `json:"missedSteps"` // Count of consecutive missed state pushes
+	Lagging       bool      `json:"lagging"`     // True when the engine has missed recent steps; its section is stale
 }
 
 type Position struct {
@@ -146,6 +153,61 @@ type HaloResponse struct {
 	HaloCells [9][9]bool `json:"haloCells"`
 }
 
+const (
+	gridCols = 10
+	gridRows = 10
+)
+
+func durationFromEnv(key string, fallback time.Duration) time.Duration {
+	if raw := os.Getenv(key); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+		log.Printf("Ignoring invalid %s=%q, using %v", key, raw, fallback)
+	}
+	return fallback
+}
+
+func intFromEnv(key string, fallback int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+		log.Printf("Ignoring invalid %s=%q, using %d", key, raw, fallback)
+	}
+	return fallback
+}
+
+// spiralSlotOrder returns every slot index in the layout sorted by distance
+// from the centre, so newly joining engines fill a compact blob that grows
+// outward rather than a strip along the top row.
+func spiralSlotOrder(cols, rows int) []int {
+	centreX := float64(cols-1) / 2
+	centreY := float64(rows-1) / 2
+	order := make([]int, 0, cols*rows)
+	for slot := 0; slot < cols*rows; slot++ {
+		order = append(order, slot)
+	}
+	distance := func(slot int) float64 {
+		dx := float64(slot%cols) - centreX
+		dy := float64(slot/cols) - centreY
+		return dx*dx + dy*dy
+	}
+	angle := func(slot int) float64 {
+		dx := float64(slot%cols) - centreX
+		dy := float64(slot/cols) - centreY
+		return math.Atan2(dy, dx)
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		di, dj := distance(order[i]), distance(order[j])
+		if di != dj {
+			return di < dj
+		}
+		return angle(order[i]) < angle(order[j])
+	})
+	return order
+}
+
 func NewController() *Controller {
 	regionID := os.Getenv("REGION_ID")
 	if regionID == "" {
@@ -166,7 +228,11 @@ func NewController() *Controller {
 		regionID:          regionID,
 		readyEngines:      make(map[int]bool),
 		stepInProgress:    false,
-		barrierTimeout:    1000 * time.Millisecond, // 1 second barrier timeout
+		barrierTimeout:    durationFromEnv("BARRIER_TIMEOUT", 1000*time.Millisecond),
+		stepInterval:      durationFromEnv("STEP_INTERVAL", 250*time.Millisecond),
+		lagThreshold:      intFromEnv("LAG_THRESHOLD", 2),
+		staleThreshold:    intFromEnv("STALE_THRESHOLD", 40),
+		slotOrder:         spiralSlotOrder(gridCols, gridRows),
 		steppingPaused:    false,
 		wsClients:         make(map[*websocket.Conn]bool),
 		wsUpgrader: websocket.Upgrader{
@@ -240,11 +306,11 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 		}
 	}
 	
-	// Find first available position
+	// Find the free slot nearest the centre of the layout
 	position := -1
-	for i := 0; i < 100; i++ {
-		if _, exists := c.nodes[i]; !exists {
-			position = i
+	for _, slot := range c.slotOrder {
+		if _, exists := c.nodes[slot]; !exists {
+			position = slot
 			break
 		}
 	}
@@ -254,8 +320,8 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 	}
 	
 	// Convert position to row/col (10x10 grid layout)
-	row := position / 10
-	col := position % 10
+	row := position / gridCols
+	col := position % gridCols
 	
 	now := time.Now()
 	c.nodes[position] = &NodeInfo{
@@ -556,10 +622,18 @@ func (c *Controller) updateMissedSteps() {
 	for position, node := range c.nodes {
 		if c.readyEngines[position] {
 			// Engine was ready, reset missed steps
+			if node.Lagging {
+				log.Printf("Engine %s at position %d caught up", node.PodID, position)
+			}
 			node.MissedSteps = 0
+			node.Lagging = false
 		} else {
-			// Engine missed this step
+			// Engine missed this step; its section is soft-skipped (frozen) until it catches up
 			node.MissedSteps++
+			if !node.Lagging && node.MissedSteps >= c.lagThreshold {
+				log.Printf("Engine %s at position %d is lagging (missed %d steps)", node.PodID, position, node.MissedSteps)
+				node.Lagging = true
+			}
 		}
 	}
 }
@@ -567,7 +641,7 @@ func (c *Controller) updateMissedSteps() {
 // cleanupStaleEngines removes engines that have missed too many steps
 func (c *Controller) cleanupStaleEngines() {
 	for position, node := range c.nodes {
-		if node.MissedSteps >= 3 {
+		if node.MissedSteps >= c.staleThreshold {
 			log.Printf("Removing stale engine %s at position %d (missed %d steps)", 
 				node.PodID, position, node.MissedSteps)
 			delete(c.nodes, position)
@@ -666,7 +740,7 @@ func (c *Controller) removeWebSocketClient(client *websocket.Conn) {
 // (slow path). Engines that don't report ready before the timeout are counted as
 // missing the step and may be cleaned up by cleanupStaleEngines.
 func (c *Controller) barrierCoordinator() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 
 	lastStep := time.Now()
@@ -680,7 +754,18 @@ func (c *Controller) barrierCoordinator() {
 		totalEngines := len(c.nodes)
 		elapsed := time.Since(lastStep)
 
-		if readyCount >= totalEngines || elapsed >= c.barrierTimeout {
+		// Lagging engines don't hold the barrier: the rest of the grid keeps
+		// its cadence and the laggard's section stays frozen until it catches up.
+		for position, node := range c.nodes {
+			if node.Lagging && !c.readyEngines[position] {
+				totalEngines--
+			}
+		}
+
+		// Fixed tick: never step faster than stepInterval, even if everyone is
+		// ready. Past the barrier timeout, step anyway and let laggards catch up.
+		allReady := readyCount >= totalEngines
+		if (allReady && elapsed >= c.stepInterval) || elapsed >= c.barrierTimeout {
 			log.Printf("Barrier sync: %d/%d engines ready (%v elapsed), broadcasting step for generation %d",
 				readyCount, totalEngines, elapsed.Round(time.Millisecond), c.currentGeneration)
 
@@ -1108,7 +1193,6 @@ func main() {
 	r.HandleFunc("/aggregated-state", controller.handleAggregatedState).Methods("GET")
 	r.HandleFunc("/topology", controller.handleTopology).Methods("GET")
 	r.HandleFunc("/api/click", controller.handleClick).Methods("POST")
-	r.HandleFunc("/api/randomize", controller.handleRandomize).Methods("POST")
 	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
 	
 	// Legacy API mapping
@@ -1120,17 +1204,30 @@ func main() {
 	// WebSocket endpoint for real-time updates
 	r.HandleFunc("/ws", controller.handleWebSocket)
 	
-	// Debug endpoints
-	r.HandleFunc("/debug/pause", controller.handleDebugPause).Methods("POST")
-	r.HandleFunc("/debug/unpause", controller.handleDebugUnpause).Methods("POST")
-	r.HandleFunc("/debug/nextstep", controller.handleDebugNextStep).Methods("POST")
+	// Admin surface: never exposed publicly. Separate listener, separate port.
+	admin := mux.NewRouter()
+	admin.HandleFunc("/api/randomize", controller.handleRandomize).Methods("POST")
+	admin.HandleFunc("/debug/pause", controller.handleDebugPause).Methods("POST")
+	admin.HandleFunc("/debug/unpause", controller.handleDebugUnpause).Methods("POST")
+	admin.HandleFunc("/debug/nextstep", controller.handleDebugNextStep).Methods("POST")
+	admin.HandleFunc("/health", controller.handleHealth).Methods("GET")
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
 	}
+	adminPort := os.Getenv("ADMIN_PORT")
+	if adminPort == "" {
+		adminPort = "8091"
+	}
+	go func() {
+		log.Printf("Admin listener on port %s (/debug/*, /api/randomize)", adminPort)
+		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", adminPort), admin))
+	}()
 
 	log.Printf("Game of Life Controller with Channels starting on port %s (Region: %s)", port, controller.regionID)
+	log.Printf("Step interval %v, barrier timeout %v, lag after %d missed, remove after %d missed",
+		controller.stepInterval, controller.barrierTimeout, controller.lagThreshold, controller.staleThreshold)
 	log.Printf("Queue sizes: register=%d, stateUpdate=%d, haloRead=%d, webRead=%d",
 		cap(controller.registerChan), cap(controller.stateUpdateChan), 
 		cap(controller.haloReadChan), cap(controller.webReadChan))

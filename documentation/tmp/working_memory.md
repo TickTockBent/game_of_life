@@ -1,36 +1,21 @@
-# Working Memory - Game of Life Project
+# Working memory — 2026-08-21
 
-## Current Status (2026-08-20)
+## Status
+- Compose stack on motherbrain, 10 engines, public at https://gameoflife.wshoffner.dev.
+- **Phase A of ROADMAP.md shipped** (controller groundwork). Verified live:
+  - spiral slot packing → 10 engines form a blob around (4,4)/(4,5)
+  - fixed tick 250ms → 3.9 gen/s measured
+  - lagging engine excluded from barrier → 3.2 gen/s with one engine paused (was 1 gen/s)
+  - `/debug/*` 404 on :8082, works on container-internal :8091
+  - eject after 40 misses (~10s), engine re-registers ~3s after recovery
 
-### Where things stand
-- Project revived after the lab move. K3s, private registry and the gameoflife DNS/tunnel
-  no longer exist. Everything now runs locally via `docker-compose.yml` (see CLAUDE.md).
-- Stack verified: 3→9→4 engine scaling, auto-healing of removed engines, WebSocket streaming,
-  controller-restart recovery.
-- Barrier fast path (step when all engines ready OR 1s timeout) gives ~9 gen/s with 3 engines,
-  vs the old fixed 1 gen/s.
+## Next: Phase B (UI rebuild, web/public/)
+- `/topology` and `/aggregated-state` now carry `lagging: true` per node — draw those sections dimmed.
+- Empty slots: dotted outlines. No text on canvas. Owner hue from stable hash of podId.
+- Light/dark via CSS custom properties + toggle.
 
-### Changes this session (uncommitted)
-- Fixed compile error in controller randomize-all (`pos` → `position`).
-- Engine: hostname/own-IP fallbacks for node ID + endpoint; step-signal watchdog (10s) that
-  triggers re-registration; gameLoop now actually calls register() when unregistered.
-- Added docker-compose.yml, .dockerignore, Makefile compose targets; Dockerfiles on Go 1.22.
-
-### Cleanup candidates (not done yet)
-- `cmd/router/`, `Dockerfile.router`, `manifests/router-deployment.yaml` — router was removed.
-- `Dockerfile.*.optimized` ×4, loose `./controller` + `./engine` binaries, `bin/`.
-- `SIMPLIFIED_ARCHITECTURE.md` describes a no-barrier-sync design that contradicts the code.
-- `HANDOFF_SESSION.md` is from July 2025.
-- Most Go files are not gofmt'd.
-- Running 10 engines as of 2026-08-20 (`make scale ENGINES=10`). REGION_ID now "motherbrain" via compose.
-
-### Public exposure (2026-08-20)
-- https://gameoflife.wshoffner.dev → `cloudflared-gameoflife.service` → web `:8090` (tunnel
-  `gameservers`, UUID f0539d6a…). Controller API is NOT exposed; web proxies /api + /ws.
-- Consequence: public engines can't register from outside until/unless the API is exposed
-  (and /register, /debug/* would need protection first).
-- All changes committed in 30cbd32; lab notebook updated (external-access.md, services.md).
-
-### Next ideas
-- Public engine needs a reachable controller again (tunnel) before it's useful.
-- Layout is hardcoded 10x10 positions; >100 engines would need topology work.
+## Known/pre-existing
+- `barrierCoordinator` and `broadcastStepToAllEngines` read `c.nodes` off the message-processor
+  goroutine (data race in principle, benign in practice). Goes away in Phase C's restructure.
+- Public page's "randomize all" button goes through the web tier's own fan-out to engines, so it
+  still works for anonymous visitors. Decide in Phase D whether that's wanted.

@@ -28,11 +28,15 @@ public read-only view at https://gameoflife.wshoffner.dev.*
 
 Each phase is independently shippable and leaves the public page working.
 
-### Phase A — Controller groundwork (small, high leverage)
+### Phase A — Controller groundwork (small, high leverage) ✅ done 2026-08-21
 - Spiral slot assignment (D6). `processRegister` only.
 - Fixed tick + miss budget + dimmed-state flag on `/aggregated-state` (D4, D5).
 - Split admin listener (D7). Compose publishes only the public port.
 - **Exit:** 10 local engines form a compact blob, step at a steady 4 gen/s, `/debug/*` unreachable on 8082.
+- *Shipped:* `STEP_INTERVAL` (250ms), `BARRIER_TIMEOUT` (1s), `LAG_THRESHOLD` (2), `STALE_THRESHOLD` (40),
+  `ADMIN_PORT` (8091, unpublished). Lagging engines are excluded from the barrier so one slow engine
+  no longer drags the grid to 1 gen/s. `/metrics` stayed public because the web tier proxies it;
+  revisit in Phase D.
 
 ### Phase B — UI rebuild (`web/public/`, still vanilla JS + canvas, no build step)
 - Layout: grid is the hero, full-bleed, canvas scales to viewport (devicePixelRatio-aware).

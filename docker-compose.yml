@@ -6,8 +6,13 @@
 #   open http://localhost:8090
 #
 # Engines register with the controller, receive a slot in the 10x10 layout,
-# and step in lockstep via barrier sync. Each engine resolves its own IP on the
-# compose network so the controller can push /step and /randomize to it.
+# and step in lockstep via barrier sync at a fixed tick (STEP_INTERVAL, default
+# 250ms = 4 gen/s). Each engine resolves its own IP on the compose network so
+# the controller can push /step and /randomize to it.
+#
+# The controller's admin surface (/debug/*, /api/randomize) listens on a second
+# port (8091) that is deliberately NOT published. Reach it with
+#   docker compose exec controller wget -qO- --post-data= http://localhost:8091/debug/pause
 
 services:
   controller:
@@ -17,7 +22,9 @@ services:
     image: gameoflife-controller:local
     environment:
       PORT: "8081"
+      ADMIN_PORT: "8091"
       REGION_ID: "${REGION_ID:-motherbrain}"
+      STEP_INTERVAL: "${STEP_INTERVAL:-250ms}"
     ports:
       - "${CONTROLLER_HOST_PORT:-8082}:8081"
     healthcheck:
