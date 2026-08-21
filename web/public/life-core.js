@@ -6,6 +6,7 @@
   const SECTION = 7;      // cells per engine side
   const LAYOUT = 10;      // slots per layout side
   const THEME_KEY = 'gol-theme';
+  const COLOR_KEY = 'gol-color-by-owner';
 
   function hashString(s) {
     let h = 2166136261;
@@ -36,7 +37,11 @@
         minCell: 4,
         ringOfEmpty: 1,            // empty slots drawn around occupied bbox
         fullBleed: false,          // canvas fills its container; grid centred with an offset
+        colorByOwner: false,       // tint cells per engine; off = single ink colour
       }, config);
+      try { const v = localStorage.getItem(COLOR_KEY); if (v !== null) view.colorByOwner = v === '1'; } catch (e) {}
+      const forcedColor = new URLSearchParams(location.search).get('color');
+      if (forcedColor === '1' || forcedColor === '0') view.colorByOwner = forcedColor === '1';
 
       view.canvas = document.getElementById('life');
       view.ctx = view.canvas.getContext('2d');
@@ -48,6 +53,7 @@
       view.hoverPos = null;
 
       setupTheme(view);
+      setupColorToggle(view);
       setupResize(view);
       setupHover(view);
       connect(view);
@@ -88,9 +94,21 @@
       dead: cs.getPropertyValue('--cell-dead').trim(),
       empty: cs.getPropertyValue('--slot-empty').trim(),
       border: cs.getPropertyValue('--section-border').trim(),
+      ink: cs.getPropertyValue('--cell-ink').trim() || cs.getPropertyValue('--fg').trim(),
       sat: parseFloat(cs.getPropertyValue('--owner-sat')) || 60,
       light: parseFloat(cs.getPropertyValue('--owner-light')) || 55,
     };
+  }
+
+  function setupColorToggle(view) {
+    const btn = document.getElementById('colorToggle');
+    const reflect = () => { if (btn) btn.setAttribute('aria-pressed', view.colorByOwner ? 'true' : 'false'); document.documentElement.classList.toggle('color-by-owner', view.colorByOwner); };
+    reflect();
+    if (btn) btn.addEventListener('click', () => {
+      view.colorByOwner = !view.colorByOwner;
+      try { localStorage.setItem(COLOR_KEY, view.colorByOwner ? '1' : '0'); } catch (e) {}
+      reflect(); draw(view); renderParticipants(view);
+    });
   }
 
   // ---------- network ----------
@@ -192,9 +210,18 @@
 
   // ---------- drawing ----------
   function ownerColor(view, node, alpha) {
+    if (!view.colorByOwner) return inkColor(view, alpha);
     const h = view.hue(node);
     const { sat, light } = view.tokens;
     return `hsla(${h}, ${sat}%, ${light}%, ${alpha == null ? 1 : alpha})`;
+  }
+
+  function inkColor(view, alpha) {
+    if (alpha == null || alpha >= 1) return view.tokens.ink;
+    if (!view._inkCtx) view._inkCtx = document.createElement('canvas').getContext('2d');
+    view._inkCtx.fillStyle = view.tokens.ink; const hex = view._inkCtx.fillStyle; // normalised #rrggbb
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
   }
 
   function draw(view) {
@@ -229,13 +256,13 @@
       for (let y = 0; y < SECTION; y++) for (let x = 0; x < SECTION; x++) {
         const on = grid && grid[y] && grid[y][x];
         const px = x0 + x * cell + gap / 2, py = y0 + y * cell + gap / 2;
-        if (on) ctx.fillStyle = view.aliveStyle ? view.aliveStyle(ctx, node, alpha, view) : alive;
+        if (on) ctx.fillStyle = (view.aliveStyle && view.colorByOwner) ? view.aliveStyle(ctx, node, alpha, view) : alive;
         else if (t.dead && t.dead !== 'transparent') ctx.fillStyle = t.dead;
         else continue;
         paintCell(ctx, px, py, size, view.shape, on);
       }
       if (t.border) {
-        ctx.strokeStyle = view.borderStyle ? view.borderStyle(node, view) : t.border;
+        ctx.strokeStyle = (view.borderStyle && view.colorByOwner) ? view.borderStyle(node, view) : t.border;
         ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, sec - 1, sec - 1);
       }
       if (view.hoverPos === pos && view.hoverStyle) view.hoverStyle(ctx, x0, y0, sec, node, view);
@@ -318,10 +345,18 @@
     const nodes = Object.entries(view.state.nodes)
       .sort((a, b) => new Date(a[1].registeredAt) - new Date(b[1].registeredAt));
     list.innerHTML = nodes.map(([pos, node]) =>
-      `<li class="${node.lagging ? 'lag' : ''}"><span class="sw" style="background:${ownerColor(view, node)}"></span>` +
+      `<li data-pos="${pos}" class="${node.lagging ? 'lag' : ''}"><span class="sw" style="background:${ownerColor(view, node)}"></span>` +
       `<span class="nm">${escapeHtml(ownerName(node))}</span>` +
       `<span class="ago">${node.lagging ? 'catching up' : relTime(node.registeredAt)}</span></li>`).join('') ||
       '<li class="none">No engines yet — the grid is waiting.</li>';
+    if (!list.dataset.wired) {
+      list.dataset.wired = '1';
+      list.addEventListener('pointerover', (ev) => {
+        const li = ev.target.closest('li[data-pos]'); if (!li) return;
+        view.hoverPos = Number(li.dataset.pos); draw(view);
+      });
+      list.addEventListener('pointerleave', () => { view.hoverPos = null; draw(view); });
+    }
   }
 
   function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }

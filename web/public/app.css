@@ -1,19 +1,9 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Plotter · Distributed Life</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
 :root{--bg:#f7f8fa;--fg:#14213d;--rule:#c9d1dc;--muted:#9aa6b8;--accent:#d7263d;--card-bg:#fff;--card-fg:#14213d;--radius:2px;--sw-radius:0;
- --canvas-bg:transparent;--cell-dead:transparent;--slot-empty:#b8c3d1;--section-border:#7e8ca0;--owner-sat:55;--owner-light:42;
+ --canvas-bg:transparent;--cell-dead:transparent;--slot-empty:#b8c3d1;--section-border:#7e8ca0;--owner-sat:55;--owner-light:42;--cell-ink:#14213d;
  --display:'Space Grotesk',system-ui,sans-serif;--body:'Space Grotesk',system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace;
  --h1:700 1.1rem/1 var(--display);--h2:600 .7rem/1 var(--mono);--num:500 1.5rem/1 var(--mono)}
 :root.is-dark{--bg:#0b1f3a;--fg:#e6edf7;--rule:#24436b;--muted:#4f6f9c;--accent:#ffd166;--card-bg:#122c50;--card-fg:#e6edf7;
- --slot-empty:#3a5a86;--section-border:#6f8fbd;--owner-sat:65;--owner-light:72}
+ --slot-empty:#3a5a86;--section-border:#6f8fbd;--owner-sat:65;--owner-light:72;--cell-ink:#e6edf7}
 body>main{padding:0}
 :root{--paper-minor:#dde3ec;--paper-major:#c3ccd9}
 :root.is-dark{--paper-minor:#173558;--paper-major:#24436b}
@@ -54,53 +44,30 @@ aside h2{font:var(--h2);margin:0 0 .5rem;opacity:.7}
 .hint{font-size:.75rem;opacity:.55;line-height:1.4}
 @media (max-width:720px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}aside{border-left:0;border-top:1px solid var(--rule);flex-direction:row;flex-wrap:wrap}aside>*{flex:1 1 45%}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-</style>
-</head>
-<body>
-<header>
-  <h1>Life / plotted</h1>
-  <span class="sub">one pen per engine, lockstep at 4 gen/s</span>
-  <span class="spacer"></span>
-  <span id="conn" title="connection"></span>
-  <button id="themeToggle" type="button">Light / dark</button>
-</header>
-<main><canvas id="life" aria-label="Live Game of Life grid"></canvas></main>
-<aside>
-  <section><h2>Now</h2>
-    <div class="stats">
-      <div class="stat"><b id="gen">–</b><span>generation</span></div>
-      <div class="stat"><b id="rate">–</b><span>gen / s</span></div>
-      <div class="stat"><b id="engines">–</b><span>engines</span></div>
-      <div class="stat"><b id="cells">–</b><span>cells</span></div>
-    </div>
-  </section>
-  <section><h2>Computing this grid</h2><ul id="participants"></ul></section>
-  <p class="hint">Each outlined region is one engine's 7×7 section, drawn in its own pen. Faded regions are catching up. Dashed boxes are unclaimed slots. Click to reseed.</p>
-</aside>
-<div id="card" hidden></div>
-<script src="/static/life-core.js?v=5"></script>
-<script>LifeView.mount({
-  shape:'square', gap:0.14, ringOfEmpty:1, fullBleed:true,
-  // graph paper drawn on the same lattice as the cells: minor rule every cell, major every section
-  drawBackground(ctx,view){
-    const cs=getComputedStyle(document.documentElement);
-    const minor=cs.getPropertyValue('--paper-minor').trim(), major=cs.getPropertyValue('--paper-major').trim();
-    const cell=view.cell, W=view.cssW, H=view.cssH;
-    // phase so that a major line falls on the grid origin
-    const px=((view.offX % (cell*7))+cell*7)%(cell*7), py=((view.offY % (cell*7))+cell*7)%(cell*7);
-    ctx.save(); ctx.lineWidth=1;
-    for(const [col,step,ph] of [[minor,cell,0],[major,cell*7,1]]){
-      ctx.strokeStyle=col; ctx.beginPath();
-      for(let x=(ph?px:view.offX%cell)+0.5;x<W;x+=step){ctx.moveTo(x,0);ctx.lineTo(x,H);}
-      for(let y=(ph?py:view.offY%cell)+0.5;y<H;y+=step){ctx.moveTo(0,y);ctx.lineTo(W,y);}
-      ctx.stroke();
-    }
-    ctx.restore();
-  },
-  hue(n){ const pens=[210,0,140,30,270,170,330,60]; return pens[this.rank(n)%pens.length]; }, // plotter pen set
-  borderStyle(node,view){ return `hsla(${view.hue(node)},${view.tokens.sat}%,${view.tokens.light}%,.9)`; },
-  hoverStyle(ctx,x,y,s,node,view){ ctx.save(); ctx.fillStyle=`hsla(${view.hue(node)},60%,50%,.08)`; ctx.fillRect(x,y,s,s); ctx.restore(); }
-});
-</script>
-</body>
-</html>
+
+/* ---- controls ---- */
+header nav{display:flex;align-items:center;gap:.5rem}
+.ctl{font:inherit;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;background:none;border:1px solid var(--rule);color:inherit;padding:.3rem .7rem;border-radius:var(--radius);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:.45rem}
+.ctl:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ctl .pip{width:.55rem;height:.55rem;border:1px solid currentColor;display:inline-block}
+.ctl[aria-pressed=true] .pip{background:var(--accent);border-color:var(--accent)}
+html:not(.color-by-owner) #participants .sw{background:var(--fg)!important;opacity:.25}
+#participants li[data-pos]{cursor:default}
+#participants li[data-pos]:hover .nm{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}
+/* ---- stats page ---- */
+body.stats-page{display:block}
+body.stats-page header{border-bottom:1px solid var(--rule)}
+body.stats-page main{display:block;place-items:initial;position:static;padding:1.5rem clamp(1rem,4vw,3rem);max-width:80rem;margin:0 auto}
+.stats-page h2{font:var(--h2);text-transform:uppercase;letter-spacing:.14em;opacity:.7;margin:1.8rem 0 .6rem}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.8rem}
+.tile{border:1px solid var(--rule);padding:.8rem 1rem}
+.tile b{display:block;font:var(--num);overflow:hidden;text-overflow:ellipsis}
+.tile b.txt{font-size:1.1rem;line-height:1.5}
+.tile span{font-size:.72rem;opacity:.6;text-transform:uppercase;letter-spacing:.08em}
+table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:.8rem}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--rule);white-space:nowrap}
+th{font-weight:500;opacity:.6;text-transform:uppercase;letter-spacing:.08em;font-size:.68rem}
+tr.lag td{opacity:.45}
+.tablewrap{overflow-x:auto}
+.actions{display:flex;gap:.6rem;align-items:center;margin-top:1rem}
+.actions .msg{font-size:.78rem;opacity:.65;font-family:var(--mono)}

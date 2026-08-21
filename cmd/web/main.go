@@ -58,6 +58,7 @@ func NewWebServer() *WebServer {
 
 // Serve the main HTML page
 func (w *WebServer) handleIndex(rw http.ResponseWriter, r *http.Request) {
+	rw.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	http.ServeFile(rw, r, "static/public/index.html")
 }
 
@@ -432,6 +433,12 @@ func main() {
 	r.HandleFunc("/ws", webServer.handleWebSocket)
 	
 	// Main page
+	r.HandleFunc("/stats.html", func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		http.ServeFile(rw, r, "static/public/stats.html")
+	}).Methods("GET")
+	r.PathPrefix("/classic/").Handler(noCache(http.StripPrefix("/classic/",
+		http.FileServer(http.Dir("static/public/classic/")))))
 	r.HandleFunc("/", webServer.handleIndex).Methods("GET")
 
 	port := os.Getenv("PORT")
