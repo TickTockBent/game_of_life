@@ -5,6 +5,27 @@ central controller, with a real-time web view showing which engine owns which pa
 
 Live: **https://gameoflife.wshoffner.dev**
 
+## Join the grid
+
+Anything that runs Docker can compute a section of the live grid at
+https://gameoflife.wshoffner.dev — no account, no ports to open; the engine makes one outbound
+WebSocket connection and that's it.
+
+```bash
+docker run -d --name life --restart unless-stopped -e DISPLAY_NAME="your name" \
+  ghcr.io/ticktockbent/gameoflife-engine
+```
+
+Your section shows up on the page within a few seconds. `docker rm -f life` to leave. Images are
+built for `amd64` and `arm64` (Raspberry Pi 4/5, Apple Silicon). Limits: 2 engines per public
+address, 90 public slots. If your connection blips the controller holds your slot for a minute.
+
+| env | default | |
+|---|---|---|
+| `DISPLAY_NAME` | *(engine id)* | shown on the page, 32 chars max |
+| `ENGINE_ID` | container hostname | stable id; reuse it to get the same slot back |
+| `CONTROLLER_URL` | `wss://gameoflife-api.wshoffner.dev/engine` | point at your own controller |
+
 ## How it works
 
 - **Engine** — owns one 7×7 section of the grid. It opens a single WebSocket to the controller

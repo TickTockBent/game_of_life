@@ -32,10 +32,36 @@
     </div>
   </section>
   <section><h2>Computing this grid</h2><ul id="participants"></ul></section>
+  <section class="join">
+    <h2>Add your machine</h2>
+    <p class="join-lead">Anything that runs Docker — laptop, Pi, NAS — can compute a section. One command, nothing to open or configure; it connects outbound.</p>
+    <label class="join-name">Shown as <input id="joinName" type="text" maxlength="32" placeholder="your name" autocomplete="off" spellcheck="false"></label>
+    <div class="cmd"><code id="joinCmd"></code><button id="copyCmd" type="button" class="ctl">Copy</button></div>
+    <p class="hint">Your section appears here within a few seconds. Stop it with <code>docker rm -f life</code>. Up to 2 engines per address.</p>
+  </section>
   <p class="hint">Each outlined region is one engine's 7×7 section of a single shared grid. Faded regions are catching up. Dashed boxes are free slots. Hover a name to find its section; click a section to reseed it.</p>
 </aside>
 <div id="card" hidden></div>
 <script src="/static/life-core.js?v=6"></script>
+<script>
+(function(){
+  const KEY='gol-join-name', input=document.getElementById('joinName'), out=document.getElementById('joinCmd'), btn=document.getElementById('copyCmd');
+  try{ input.value=localStorage.getItem(KEY)||''; }catch(e){}
+  const shellQuote=s=>"'"+s.replace(/'/g,"'\\''")+"'";
+  function render(){
+    const name=input.value.trim();
+    const env=name?` -e DISPLAY_NAME=${shellQuote(name)}`:'';
+    out.textContent=`docker run -d --name life --restart unless-stopped${env} ghcr.io/ticktockbent/gameoflife-engine`;
+    try{ localStorage.setItem(KEY,name); }catch(e){}
+  }
+  input.addEventListener('input',render); render();
+  btn.addEventListener('click',async()=>{
+    try{ await navigator.clipboard.writeText(out.textContent); btn.textContent='Copied'; }
+    catch(e){ const r=document.createRange(); r.selectNodeContents(out); const sel=getSelection(); sel.removeAllRanges(); sel.addRange(r); btn.textContent='Select + copy'; }
+    setTimeout(()=>btn.textContent='Copy',1500);
+  });
+})();
+</script>
 <script>LifeView.mount({
   shape:'square', gap:0.14, ringOfEmpty:1, fullBleed:true,
   // graph paper drawn on the same lattice as the cells: minor rule every cell, major every section

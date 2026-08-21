@@ -80,7 +80,7 @@ Each phase is independently shippable and leaves the public page working.
 - **Exit:** a laptop on phone tethering runs the engine, shows up on the page, survives a 30 s
   network drop.
 
-### Phase E — Distribution + "Join" UX
+### Phase E — Distribution + "Join" UX ✅ shipped 2026-08-21
 - GitHub Actions: on `v*` tag, buildx amd64+arm64 → `ghcr.io/ticktockbent/gameoflife-engine`
   (and `-controller`, `-web` for the house stack).
 - Public page gets a **Join** panel: the one-liner with a copy button, a `DISPLAY_NAME` field that
