@@ -35,6 +35,7 @@
         shape: 'square',           // 'square' | 'dot' | 'rounded'
         minCell: 4,
         ringOfEmpty: 1,            // empty slots drawn around occupied bbox
+        fullBleed: false,          // canvas fills its container; grid centred with an offset
       }, config);
 
       view.canvas = document.getElementById('life');
@@ -150,14 +151,36 @@
 
   function fit(view) {
     if (!view.box) return;
-    const rect = view.canvas.parentElement.getBoundingClientRect();
+    let rect;
+    if (view.fullBleed) {
+      // pin the canvas to its container and measure the canvas itself
+      Object.assign(view.canvas.style, { position: 'absolute', inset: '0', width: '100%', height: '100%' });
+      rect = { width: view.canvas.clientWidth, height: view.canvas.clientHeight };
+    } else {
+      const parent = view.canvas.parentElement;
+      const pcs = getComputedStyle(parent);
+      rect = {
+        width: parent.clientWidth - parseFloat(pcs.paddingLeft) - parseFloat(pcs.paddingRight),
+        height: parent.clientHeight - parseFloat(pcs.paddingTop) - parseFloat(pcs.paddingBottom),
+      };
+    }
     const dpr = window.devicePixelRatio || 1;
     const cellsW = view.box.cols * SECTION, cellsH = view.box.rows * SECTION;
     const cell = Math.max(view.minCell, Math.floor(Math.min(rect.width / cellsW, rect.height / cellsH)));
     view.cell = cell;
-    view.cssW = cellsW * cell; view.cssH = cellsH * cell;
-    view.canvas.style.width = view.cssW + 'px';
-    view.canvas.style.height = view.cssH + 'px';
+    if (view.fullBleed) {
+      view.cssW = Math.floor(rect.width); view.cssH = Math.floor(rect.height);
+      // snap the offset to the cell pitch so background rules and cells share one lattice
+      view.offX = Math.floor((view.cssW - cellsW * cell) / 2 / cell) * cell;
+      view.offY = Math.floor((view.cssH - cellsH * cell) / 2 / cell) * cell;
+    } else {
+      view.cssW = cellsW * cell; view.cssH = cellsH * cell;
+      view.offX = 0; view.offY = 0;
+    }
+    if (!view.fullBleed) {
+      view.canvas.style.width = view.cssW + 'px';
+      view.canvas.style.height = view.cssH + 'px';
+    }
     view.canvas.width = Math.round(view.cssW * dpr);
     view.canvas.height = Math.round(view.cssH * dpr);
     view.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -180,6 +203,9 @@
     const { minR, minC, rows, cols } = view.box;
     ctx.clearRect(0, 0, view.cssW, view.cssH);
     if (t.bg && t.bg !== 'transparent') { ctx.fillStyle = t.bg; ctx.fillRect(0, 0, view.cssW, view.cssH); }
+    if (view.drawBackground) view.drawBackground(ctx, view);
+    ctx.save();
+    ctx.translate(view.offX, view.offY);
 
     const gap = Math.max(cell > 6 ? 1 : 0, Math.round(cell * view.gap));
     const size = cell - gap;
@@ -214,6 +240,7 @@
       }
       if (view.hoverPos === pos && view.hoverStyle) view.hoverStyle(ctx, x0, y0, sec, node, view);
     }
+    ctx.restore();
   }
 
   function paintCell(ctx, x, y, s, shape, alive) {
@@ -233,9 +260,10 @@
     const move = (ev) => {
       if (!view.box) return;
       const rect = cv.getBoundingClientRect();
-      const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+      const x = ev.clientX - rect.left - view.offX, y = ev.clientY - rect.top - view.offY;
       const sec = SECTION * view.cell;
       const c = Math.floor(x / sec), r = Math.floor(y / sec);
+      if (x < 0 || y < 0 || c >= view.box.cols || r >= view.box.rows) { hideCard(view); return; }
       const pos = (r + view.box.minR) * LAYOUT + (c + view.box.minC);
       const node = view.state.nodes[pos];
       if (!node) { hideCard(view); return; }
@@ -247,8 +275,9 @@
     cv.addEventListener('click', (ev) => {
       if (!view.box) return;
       const rect = cv.getBoundingClientRect();
-      const x = Math.floor((ev.clientX - rect.left) / view.cell) + view.box.minC * SECTION;
-      const y = Math.floor((ev.clientY - rect.top) / view.cell) + view.box.minR * SECTION;
+      const x = Math.floor((ev.clientX - rect.left - view.offX) / view.cell) + view.box.minC * SECTION;
+      const y = Math.floor((ev.clientY - rect.top - view.offY) / view.cell) + view.box.minR * SECTION;
+      if (x < view.box.minC * SECTION || y < view.box.minR * SECTION) return;
       fetch('/api/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ globalX: x, globalY: y, alive: true }) }).catch(() => {});
     });
   }

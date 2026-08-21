@@ -14,7 +14,9 @@
  --h1:700 1.1rem/1 var(--display);--h2:600 .7rem/1 var(--mono);--num:500 1.5rem/1 var(--mono)}
 :root.is-dark{--bg:#0b1f3a;--fg:#e6edf7;--rule:#24436b;--muted:#4f6f9c;--accent:#ffd166;--card-bg:#122c50;--card-fg:#e6edf7;
  --slot-empty:#3a5a86;--section-border:#6f8fbd;--owner-sat:65;--owner-light:72}
-main{background-image:linear-gradient(var(--rule) 1px,transparent 1px),linear-gradient(90deg,var(--rule) 1px,transparent 1px);background-size:24px 24px;background-position:center}
+body>main{padding:0}
+:root{--paper-minor:#dde3ec;--paper-major:#c3ccd9}
+:root.is-dark{--paper-minor:#173558;--paper-major:#24436b}
 header h1{text-transform:uppercase;letter-spacing:.18em}
 aside h2{text-transform:uppercase;letter-spacing:.14em}
 #themeToggle{text-transform:uppercase;letter-spacing:.08em;font-size:.7rem}
@@ -78,7 +80,23 @@ aside h2{font:var(--h2);margin:0 0 .5rem;opacity:.7}
 <div id="card" hidden></div>
 <script src="/static/themes/life-core.js"></script>
 <script>LifeView.mount({
-  shape:'square', gap:0.14, ringOfEmpty:1,
+  shape:'square', gap:0.14, ringOfEmpty:1, fullBleed:true,
+  // graph paper drawn on the same lattice as the cells: minor rule every cell, major every section
+  drawBackground(ctx,view){
+    const cs=getComputedStyle(document.documentElement);
+    const minor=cs.getPropertyValue('--paper-minor').trim(), major=cs.getPropertyValue('--paper-major').trim();
+    const cell=view.cell, W=view.cssW, H=view.cssH;
+    // phase so that a major line falls on the grid origin
+    const px=((view.offX % (cell*7))+cell*7)%(cell*7), py=((view.offY % (cell*7))+cell*7)%(cell*7);
+    ctx.save(); ctx.lineWidth=1;
+    for(const [col,step,ph] of [[minor,cell,0],[major,cell*7,1]]){
+      ctx.strokeStyle=col; ctx.beginPath();
+      for(let x=(ph?px:view.offX%cell)+0.5;x<W;x+=step){ctx.moveTo(x,0);ctx.lineTo(x,H);}
+      for(let y=(ph?py:view.offY%cell)+0.5;y<H;y+=step){ctx.moveTo(0,y);ctx.lineTo(W,y);}
+      ctx.stroke();
+    }
+    ctx.restore();
+  },
   hue(n){ const pens=[210,0,140,30,270,170,330,60]; return pens[this.rank(n)%pens.length]; }, // plotter pen set
   borderStyle(node,view){ return `hsla(${view.hue(node)},${view.tokens.sat}%,${view.tokens.light}%,.9)`; },
   hoverStyle(ctx,x,y,s,node,view){ ctx.save(); ctx.fillStyle=`hsla(${view.hue(node)},60%,50%,.08)`; ctx.fillRect(x,y,s,s); ctx.restore(); }
