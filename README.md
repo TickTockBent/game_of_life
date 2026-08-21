@@ -7,17 +7,23 @@ Live: **https://gameoflife.wshoffner.dev**
 
 ## How it works
 
-- **Engine** — owns one 7×7 section of the grid. Registers with the controller, gets assigned a
-  slot in a 10×10 layout (so up to 100 engines / a 70×70 field), and then only acts when told to
-  step. Before each step it fetches a one-cell *halo* of its neighbours' border cells from the
-  controller, so patterns cross section boundaries as if it were one grid. Engines never talk to
-  each other.
-- **Controller** — single coordinator, channel-based (no locks). Aggregates state, serves halos,
-  and runs **barrier synchronization**: it broadcasts `POST /step` to every engine once all have
-  reported the previous generation, or after a 1s timeout. Engines that miss 3 steps are dropped;
-  engines that hear nothing for 10s re-register. Streams state to the web tier over WebSocket.
+- **Engine** — owns one 7×7 section of the grid. It opens a single WebSocket to the controller
+  (`/engine`), says hello, and is assigned a slot in a 10×10 layout (so up to 100 engines / a
+  70×70 field). From then on it only acts when told to: each `step` message carries the
+  controller's generation number and the full 9×9 *halo* of neighbouring border cells, the engine
+  computes one generation and replies with its new 7×7 state. Engines listen on nothing and never
+  talk to each other, so the same image runs on the compose network or on a laptop behind NAT.
+  If the socket drops, the engine reconnects with backoff and keeps its grid.
+- **Controller** — single coordinator, channel-based (one goroutine owns all state). Runs
+  **barrier synchronization** at a fixed tick (default 4 gen/s): it steps once every connected
+  engine has reported the previous generation, or after a 1s timeout. Engines that miss two steps
+  are flagged *lagging* and stop holding the barrier (their section freezes, dimmed); a
+  disconnected engine keeps its slot until it has missed 40 steps (~10s). Streams aggregated state
+  to the web tier over WebSocket. Admin endpoints (`/debug/*`, reseed-all) live on a separate,
+  unpublished port.
 - **Web** — serves the canvas UI and proxies `/api/*` and `/ws` to the controller. The controller
-  itself is never exposed publicly.
+  itself is never exposed publicly. Sections that go still or empty reseed themselves with a
+  random pattern (R-pentomino, glider, acorn, LWSS, or noise) so the field keeps moving.
 
 ## Running it
 

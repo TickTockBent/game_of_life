@@ -272,3 +272,36 @@ func TestConcurrency(t *testing.T) {
 	// If we get here without deadlock or panic, concurrency is working
 	t.Log("Concurrent access test passed")
 }
+func TestSeedPatternStaysInBounds(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		g := NewGrid()
+		g.SeedPattern()
+		alive := 0
+		for x := 0; x < GridSize; x++ {
+			for y := 0; y < GridSize; y++ {
+				if g.Cells[x][y] {
+					alive++
+				}
+			}
+		}
+		if alive == 0 {
+			t.Fatalf("iteration %d: SeedPattern produced an empty grid", i)
+		}
+	}
+}
+
+func TestHaloCornersCount(t *testing.T) {
+	g := NewGrid()
+	var halo [GridSize + 2][GridSize + 2]bool
+	halo[0][0] = true // diagonal neighbour of cell (0,0)
+	halo[0][1] = true // north of (0,0)
+	halo[1][0] = true // west of (0,0)
+	g.SetHalo(halo)
+	if n := g.countNeighbors(0, 0); n != 3 {
+		t.Fatalf("expected corner cell to see 3 halo neighbours, got %d", n)
+	}
+	g.NextGeneration()
+	if !g.Cells[0][0] {
+		t.Fatal("corner cell should be born from 3 halo neighbours")
+	}
+}

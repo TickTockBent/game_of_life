@@ -261,10 +261,15 @@ make status / logs / down
 - Tuning env on the controller: `STEP_INTERVAL` (250ms → 4 gen/s), `BARRIER_TIMEOUT` (1s),
   `LAG_THRESHOLD` (2 missed steps → `lagging: true`, excluded from barrier), `STALE_THRESHOLD`
   (40 missed → removed). Slots are assigned centre-out so engines form a blob, not a strip.
-- Engines have no host ports; the controller reaches them on the compose network. The engine
-  derives its node ID from the container hostname and its endpoint from its own interface IP
-  when `POD_NAME`/`POD_IP` are absent, so `--scale` just works.
-- Engines re-register automatically if no step signal arrives for 10s (controller restart).
+- **Engines dial the controller** (one WebSocket to `/engine`, protocol in
+  `cmd/controller/engine_ws.go`); the controller never connects to an engine and engines listen on
+  nothing. Engine env: `CONTROLLER_URL` (compose: `ws://controller:8081/engine`; default is the
+  future public `wss://gameoflife-api.wshoffner.dev/engine`), `DISPLAY_NAME`, `ENGINE_ID`
+  (default hostname). Each step message carries the full 9×9 halo (corners included).
+- Engines reconnect with backoff and keep their grid; the controller holds a disconnected
+  engine's slot until `STALE_THRESHOLD` misses. Controller restart → all engines back in ~2s.
+- Sections reseed themselves with a random pattern (R-pentomino, glider, acorn, LWSS, or noise)
+  when still/oscillating for ~30s or empty for ~10s.
 
 ## Historical: K3s Deployment Architecture
 - **Controller**: External Docker container on host (port 8082)

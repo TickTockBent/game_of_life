@@ -55,7 +55,7 @@ Each phase is independently shippable and leaves the public page working.
   parked at `/classic/`; the four design candidates remain at `/themes/`. Renderer is
   `web/public/life-core.js`. Not done: gen/s sparkline (number only), per-engine latency.
 
-### Phase C — WebSocket engine transport (D1–D3)
+### Phase C — WebSocket engine transport (D1–D3) ✅ shipped 2026-08-21
 - Controller: `/engine` WS handler → `hello{displayName, version}` / `assigned{position}` /
   `step{gen, halo}` / `state{gen, grid}` / `ping`. Internally an `EngineTransport` interface so
   the barrier code doesn't care; HTTP push implementation deleted once compose is migrated.
@@ -64,6 +64,11 @@ Each phase is independently shippable and leaves the public page working.
   `wss://gameoflife-api.wshoffner.dev`; compose overrides to `ws://controller:8081`.
 - Delete `cmd/public-engine`, `cmd/router`, `Dockerfile.router`, `*.optimized`, loose binaries.
 - **Exit:** compose stack runs on WS only; `docker compose restart controller` → engines back in < 5 s.
+- *Shipped:* measured 2 s. Also: barrier decision moved onto the processor goroutine (old data race
+  gone), halo corners fixed (diagonal neighbours across section borders now count), pattern-based
+  reseed, disconnected engines keep their slot, engineId/displayName/grid validated, 8 KB message
+  cap, protocol version handshake. Deleted: `cmd/public-engine`, `cmd/router`, `pkg/grid`,
+  `pkg/controller`, `bin/`, `*.optimized`, `SIMPLIFIED_ARCHITECTURE.md`, `README.public-engine.md`.
 
 ### Phase D — Public API surface
 - Second tunnel ingress: `gameoflife-api.wshoffner.dev → localhost:8082` (same `gameservers`

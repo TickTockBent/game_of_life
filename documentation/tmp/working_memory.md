@@ -1,21 +1,23 @@
-# Working memory — 2026-08-21
+# Working memory — 2026-08-21 (evening)
 
 ## Status
-- Compose stack on motherbrain, 10 engines, public at https://gameoflife.wshoffner.dev.
-- **Phase A of ROADMAP.md shipped** (controller groundwork). Verified live:
-  - spiral slot packing → 10 engines form a blob around (4,4)/(4,5)
-  - fixed tick 250ms → 3.9 gen/s measured
-  - lagging engine excluded from barrier → 3.2 gen/s with one engine paused (was 1 gen/s)
-  - `/debug/*` 404 on :8082, works on container-internal :8091
-  - eject after 40 misses (~10s), engine re-registers ~3s after recovery
+- Phases A, B, C shipped and live. 10 engines on WebSocket transport, Plotter UI at /.
+- Branch `ws-transport` merged to main.
 
-## Next: Phase B (UI rebuild, web/public/)
-- `/topology` and `/aggregated-state` now carry `lagging: true` per node — draw those sections dimmed.
-- Empty slots: dotted outlines. No text on canvas. Owner hue from stable hash of podId.
-- Light/dark via CSS custom properties + toggle.
+## Verified today (Phase C)
+- controller restart → 10/10 engines back in 2s
+- engine container stop/start → slot held (`connected:false`), rejoins same slot
+- lag: paused engine flagged, excluded from barrier, rejoins
+- click + reseed-all go web → controller → engine socket
+- `go test ./...` green (engine WS session test, grid corner-halo test, SeedPattern bounds test)
 
-## Known/pre-existing
-- `barrierCoordinator` and `broadcastStepToAllEngines` read `c.nodes` off the message-processor
-  goroutine (data race in principle, benign in practice). Goes away in Phase C's restructure.
-- Public page's "randomize all" button goes through the web tier's own fan-out to engines, so it
-  still works for anonymous visitors. Decide in Phase D whether that's wanted.
+## Next: Phase D (public API surface)
+- Add ingress `gameoflife-api.wshoffner.dev → http://localhost:8082` to /etc/cloudflared/gameoflife.yml
+  (same tunnel f0539d6a…), `cloudflared tunnel route dns f0539d6a-a267-4786-99c2-241be68f2648 gameoflife-api.wshoffner.dev`,
+  restart cloudflared-gameoflife.service. Engine default CONTROLLER_URL already points there.
+- Controller limits still to add: per-IP connection cap (≤2), reserved house slots (10), per-step
+  state-message rate cap. Already done: 8 KB cap, grid/engineId/displayName validation, version handshake.
+- Then Phase E: GHCR multi-arch images + Join panel.
+
+## Known
+- /metrics stays public (web proxies it). Cloudflare edge caches .js/.css 4h → bump ?v= on change.

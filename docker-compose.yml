@@ -7,8 +7,9 @@
 #
 # Engines register with the controller, receive a slot in the 10x10 layout,
 # and step in lockstep via barrier sync at a fixed tick (STEP_INTERVAL, default
-# 250ms = 4 gen/s). Each engine resolves its own IP on the compose network so
-# the controller can push /step and /randomize to it.
+# 250ms = 4 gen/s). Each engine holds ONE outbound WebSocket to the controller
+# (/engine); the controller never dials an engine, so the same image works from
+# behind NAT anywhere.
 #
 # The controller's admin surface (/debug/*, /api/randomize) listens on a second
 # port (8091) that is deliberately NOT published. Reach it with
@@ -40,7 +41,8 @@ services:
       dockerfile: Dockerfile.engine
     image: gameoflife-engine:local
     environment:
-      CONTROLLER_URL: "http://controller:8081"
+      CONTROLLER_URL: "ws://controller:8081/engine"
+      # DISPLAY_NAME: "house engine"
     depends_on:
       controller:
         condition: service_healthy
@@ -59,6 +61,7 @@ services:
     environment:
       PORT: "8080"
       CONTROLLER_URL: "http://controller:8081"
+      CONTROLLER_ADMIN_URL: "http://controller:8091"
     ports:
       - "${WEB_HOST_PORT:-8090}:8080"
     depends_on:

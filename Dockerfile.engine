@@ -13,5 +13,4 @@ WORKDIR /root/
 
 COPY --from=builder /app/engine .
 
-EXPOSE 8080
 CMD ["./engine"]
