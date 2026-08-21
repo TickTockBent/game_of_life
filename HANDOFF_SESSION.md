@@ -16,11 +16,11 @@ All five roadmap phases are shipped and running:
 **Running right now:** controller + web + 10 engines on motherbrain (compose, `restart: unless-stopped`),
 public at https://gameoflife.wshoffner.dev, engine API at https://gameoflife-api.wshoffner.dev.
 
-## The one thing blocking "anyone can join"
+## Public joining: verified end-to-end (2026-08-21)
 
-The GHCR package is **private** (inherited from the repo). No API for this — one click in the UI:
-https://github.com/users/TickTockBent/packages/container/gameoflife-engine/settings → Change visibility → Public.
-Then from any machine: `docker run -d --name life -e DISPLAY_NAME="me" ghcr.io/ticktockbent/gameoflife-engine`.
+`ghcr.io/ticktockbent/gameoflife-engine` was flipped to Public in the GitHub UI (packages inherit the
+private repo's visibility; controller/web images stay private). Wes ran the Join-panel command from
+an outside machine and `test1` appeared on the page. Nothing blocks "anyone can join" any more.
 
 ## How to resume
 

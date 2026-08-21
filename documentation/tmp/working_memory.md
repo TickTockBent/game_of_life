@@ -3,12 +3,9 @@
 ## Status
 All five roadmap phases (A–E) shipped and live. v1.0.0 tagged; CI built amd64+arm64 images to GHCR.
 
-## BLOCKER for "anyone can join" — one click in the GitHub UI
-GHCR packages inherited the repo's private visibility, so `docker pull ghcr.io/ticktockbent/gameoflife-engine`
-fails anonymously. Make the package public (no API for this):
-  https://github.com/users/TickTockBent/packages/container/gameoflife-engine/settings → Danger zone → Change visibility → Public
-(controller/web packages can stay private; only the engine needs to be public.)
-Then verify from any machine: `docker run --rm ghcr.io/ticktockbent/gameoflife-engine` → appears on the page.
+## Public joining — DONE (2026-08-21)
+Engine package flipped to Public in the GitHub UI (only the engine; controller/web stay private).
+Verified: one `docker run` from outside → `test1` joined the grid.
 
 ## Verified today
 - Phase C: controller restart → 10 engines back in 2s; slot held on engine drop; click/reseed via WS
