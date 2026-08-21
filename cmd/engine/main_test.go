@@ -4,147 +4,118 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
 
-func setupTestEngine() (*Engine, *mux.Router) {
+// fakeController accepts one engine, walks it through hello → assigned →
+// step → reseed, and reports what it saw.
+func TestEngineSession(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	got := make(chan stateMsg, 8)
+	helloSeen := make(chan helloMsg, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/engine" {
+			t.Errorf("engine dialled %s, want /engine", r.URL.Path)
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+
+		var hello helloMsg
+		if err := ws.ReadJSON(&hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		helloSeen <- hello
+
+		ws.WriteJSON(map[string]interface{}{"type": "assigned", "position": 44, "row": 4, "col": 4, "generation": 100})
+		readState := func() {
+			var st stateMsg
+			if err := ws.ReadJSON(&st); err != nil {
+				t.Errorf("read state: %v", err)
+				return
+			}
+			got <- st
+		}
+		readState() // initial state after assignment
+
+		var halo [9][9]bool
+		ws.WriteJSON(map[string]interface{}{"type": "step", "generation": 101, "halo": halo})
+		readState()
+
+		ws.WriteJSON(map[string]interface{}{"type": "reseed"})
+		readState()
+	}))
+	defer server.Close()
+
+	t.Setenv("CONTROLLER_URL", strings.Replace(server.URL, "http://", "ws://", 1))
+	t.Setenv("ENGINE_ID", "test-engine")
+	t.Setenv("DISPLAY_NAME", "Tester")
 	engine := NewEngine()
-
-	router := mux.NewRouter()
-	router.HandleFunc("/health", engine.handleHealth).Methods("GET")
-	router.HandleFunc("/step", engine.handleStep).Methods("POST")
-	router.HandleFunc("/randomize", engine.handleRandomize).Methods("POST")
-
-	return engine, router
-}
-
-func TestHealthEndpoint(t *testing.T) {
-	engine, router := setupTestEngine()
-
-	req, _ := http.NewRequest("GET", "/health", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("Expected status 200, got %d", recorder.Code)
+	if !strings.HasSuffix(engine.controlURL, "/engine") {
+		t.Fatalf("controlURL should end in /engine, got %s", engine.controlURL)
 	}
 
-	var health map[string]interface{}
-	if err := json.NewDecoder(recorder.Body).Decode(&health); err != nil {
-		t.Fatal("Failed to decode health response:", err)
-	}
+	done := make(chan error, 1)
+	go func() { done <- engine.session() }()
 
-	if health["status"] != "healthy" {
-		t.Errorf("Expected status 'healthy', got %v", health["status"])
-	}
-	if health["nodeId"] != engine.nodeID {
-		t.Errorf("Expected nodeId '%s', got %v", engine.nodeID, health["nodeId"])
-	}
-	if health["registered"] != false {
-		t.Error("Expected registered=false for new engine")
-	}
-	if health["position"].(float64) != -1 {
-		t.Errorf("Expected position -1 for unregistered engine, got %v", health["position"])
-	}
-}
-
-func TestStepWhenUnregistered(t *testing.T) {
-	_, router := setupTestEngine()
-
-	req, _ := http.NewRequest("POST", "/step", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status 503 for step when unregistered, got %d", recorder.Code)
-	}
-}
-
-func TestStepWhenRegistered(t *testing.T) {
-	engine, router := setupTestEngine()
-
-	// Simulate successful registration
-	engine.registered = true
-	engine.position = 0
-
-	req, _ := http.NewRequest("POST", "/step", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200 for step when registered, got %d", recorder.Code)
-	}
-
-	// Verify the step signal was queued on the step channel
 	select {
-	case <-engine.stepChan:
-		// Step signal received - expected
-	default:
-		t.Error("Expected step signal to be queued on stepChan")
-	}
-}
-
-func TestStepChannelFull(t *testing.T) {
-	engine, router := setupTestEngine()
-	engine.registered = true
-	engine.position = 0
-
-	// Fill the step channel (capacity is 10)
-	for i := 0; i < 10; i++ {
-		engine.stepChan <- struct{}{}
+	case hello := <-helloSeen:
+		if hello.Type != "hello" || hello.EngineID != "test-engine" || hello.DisplayName != "Tester" || hello.Version != protocolVersion {
+			t.Fatalf("unexpected hello: %+v", hello)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no hello within 2s")
 	}
 
-	// Now step should still return 200 (drops the signal gracefully)
-	req, _ := http.NewRequest("POST", "/step", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200 when step channel is full, got %d", recorder.Code)
+	expect := func(wantGen int64, label string) stateMsg {
+		select {
+		case st := <-got:
+			if st.Type != "state" || st.Generation != wantGen || len(st.Grid) != 7 || len(st.Grid[0]) != 7 {
+				t.Fatalf("%s: unexpected state %+v", label, st)
+			}
+			return st
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: no state within 2s", label)
+		}
+		return stateMsg{}
 	}
-}
+	expect(100, "after assigned")
+	expect(101, "after step")
+	reseeded := expect(101, "after reseed")
 
-func TestRandomizeEndpoint(t *testing.T) {
-	engine, router := setupTestEngine()
-
-	// Advance generation to non-zero
-	engine.grid.NextGeneration()
-	engine.grid.NextGeneration()
-	initialGen := engine.grid.GetGeneration()
-	if initialGen != 2 {
-		t.Fatalf("Expected generation 2 before randomize, got %d", initialGen)
-	}
-
-	req, _ := http.NewRequest("POST", "/randomize", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Expected status 200 for randomize, got %d", recorder.Code)
-	}
-
-	// Randomize should reset generation to 0
-	if engine.grid.GetGeneration() != 0 {
-		t.Errorf("Expected generation 0 after randomize, got %d", engine.grid.GetGeneration())
-	}
-
-	// Check that at least some cells are alive
-	state, _ := engine.grid.GetState()
-	hasAliveCell := false
-	for row := range state {
-		for col := range state[row] {
-			if state[row][col] {
-				hasAliveCell = true
-				break
+	alive := 0
+	for _, row := range reseeded.Grid {
+		for _, cell := range row {
+			if cell {
+				alive++
 			}
 		}
-		if hasAliveCell {
-			break
-		}
 	}
-	if !hasAliveCell {
-		t.Error("Randomize should create at least some alive cells")
+	if alive == 0 {
+		t.Fatal("reseed produced an empty section")
+	}
+	if engine.position != 44 {
+		t.Fatalf("position = %d, want 44", engine.position)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not end after server closed")
+	}
+}
+
+func TestStateMsgWireFormat(t *testing.T) {
+	data, _ := json.Marshal(stateMsg{Type: "state", Generation: 7, Grid: [][]bool{{true}}})
+	if string(data) != `{"type":"state","generation":7,"grid":[[true]]}` {
+		t.Fatalf("wire format drifted: %s", data)
 	}
 }

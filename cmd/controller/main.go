@@ -1,13 +1,13 @@
 package main
 
 import (
-	"math"
-	"sort"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -20,42 +20,41 @@ import (
 // Controller with channel-based message handling and zero locks
 type Controller struct {
 	// Message channels for different request types
-	registerChan    chan *RegisterMessage
-	stateUpdateChan chan *StateUpdateMessage
-	haloReadChan    chan *HaloReadMessage
-	webReadChan     chan *WebReadMessage
-	clickChan       chan *ClickMessage
-	stepBroadcastChan chan *StepBroadcastMessage
-	randomizeAllChan  chan *RandomizeAllMessage
-	
+	registerChan     chan *RegisterMessage
+	stateUpdateChan  chan *StateUpdateMessage
+	webReadChan      chan *WebReadMessage
+	clickChan        chan *ClickMessage
+	disconnectChan   chan *DisconnectMessage
+	manualStepChan   chan struct{}
+	randomizeAllChan chan *RandomizeAllMessage
+
 	// State (only accessed by the main goroutine)
 	nodes             map[int]*NodeInfo
 	gridStates        map[int]*GridState
 	currentGeneration int64
 	regionID          string
-	
+
 	// Barrier sync state
-	readyEngines      map[int]bool  // tracks which engines are ready for current generation
-	stepInProgress    bool          // true when step broadcast is in progress
-	barrierTimeout    time.Duration // timeout for waiting for all engines
-	stepInterval      time.Duration // minimum time between steps (fixed tick)
-	lagThreshold      int           // missed steps before an engine is flagged lagging
-	staleThreshold    int           // missed steps before an engine is removed
-	slotOrder         []int         // slot assignment order (centre-out spiral)
-	
+	readyEngines   map[int]bool  // tracks which engines are ready for current generation
+	barrierTimeout time.Duration // timeout for waiting for all engines
+	stepInterval   time.Duration // minimum time between steps (fixed tick)
+	lagThreshold   int           // missed steps before an engine is flagged lagging
+	staleThreshold int           // missed steps before an engine is removed
+	slotOrder      []int         // slot assignment order (centre-out spiral)
+
 	// Debug controls
-	steppingPaused    bool          // When true, barrier coordinator won't auto-step
-	
+	steppingPaused bool // When true, barrier coordinator won't auto-step
+
 	// WebSocket clients for real-time updates
-	wsClients    map[*websocket.Conn]bool // connected WebSocket clients
-	wsMutex      sync.RWMutex             // protects wsClients map
-	wsUpgrader   websocket.Upgrader       // WebSocket upgrader
-	
+	wsClients  map[*websocket.Conn]bool // connected WebSocket clients
+	wsMutex    sync.RWMutex             // protects wsClients map
+	wsUpgrader websocket.Upgrader       // WebSocket upgrader
+
 	// Metrics (atomic counters)
-	registerQueueSize    int64
-	stateUpdateQueueSize int64
-	haloReadQueueSize    int64
-	webReadQueueSize     int64
+	registerQueueSize      int64
+	stateUpdateQueueSize   int64
+	haloReadQueueSize      int64
+	webReadQueueSize       int64
 	stepBroadcastQueueSize int64
 }
 
@@ -67,13 +66,14 @@ type RegisterMessage struct {
 
 type StateUpdateMessage struct {
 	Position int
+	Conn     *engineConn // socket the update arrived on; stale sockets are ignored
 	Request  StateUpdateRequest
 	Response chan error
 }
 
-type HaloReadMessage struct {
+type DisconnectMessage struct {
 	Position int
-	Response chan HaloResponse
+	Conn     *engineConn
 }
 
 type WebReadMessage struct {
@@ -86,25 +86,22 @@ type ClickMessage struct {
 	Response chan error
 }
 
-type StepBroadcastMessage struct {
-	Position int
-	Response chan error
-}
-
 type RandomizeAllMessage struct {
 	Response chan int
 }
 
 // Data types
 type NodeInfo struct {
-	PodID         string    `json:"podId"`
-	DisplayName   string    `json:"displayName,omitempty"` // Optional user-friendly name
-	Position      Position  `json:"position"`
-	Endpoint      string    `json:"endpoint"`
-	RegisteredAt  time.Time `json:"registeredAt"`
-	LastHeartbeat time.Time `json:"lastHeartbeat"`
-	MissedSteps   int       `json:"missedSteps"` // Count of consecutive missed state pushes
-	Lagging       bool      `json:"lagging"`     // True when the engine has missed recent steps; its section is stale
+	PodID         string      `json:"podId"`
+	DisplayName   string      `json:"displayName,omitempty"` // Optional user-friendly name
+	Position      Position    `json:"position"`
+	Endpoint      string      `json:"endpoint"`
+	RegisteredAt  time.Time   `json:"registeredAt"`
+	LastHeartbeat time.Time   `json:"lastHeartbeat"`
+	MissedSteps   int         `json:"missedSteps"` // Count of consecutive missed state pushes
+	Lagging       bool        `json:"lagging"`     // True when the engine has missed recent steps; its section is stale
+	Connected     bool        `json:"connected"`   // False while the engine's socket is down (slot is held for it)
+	Conn          *engineConn `json:"-"`
 }
 
 type Position struct {
@@ -119,13 +116,15 @@ type GridState struct {
 }
 
 type RegisterRequest struct {
-	PodID       string `json:"podId"`
-	Endpoint    string `json:"endpoint"`
-	DisplayName string `json:"displayName,omitempty"` // Optional user-friendly name
+	PodID       string      `json:"podId"`
+	Endpoint    string      `json:"endpoint"`
+	DisplayName string      `json:"displayName,omitempty"` // Optional user-friendly name
+	Conn        *engineConn `json:"-"`
 }
 
 type RegisterResponse struct {
-	Position int `json:"position"`
+	Position   int   `json:"position"`
+	Generation int64 `json:"generation"`
 }
 
 type StateUpdateRequest struct {
@@ -140,13 +139,13 @@ type ClickRequest struct {
 }
 
 type TopologyResponse struct {
-	RegionID string              `json:"regionId"`
-	Nodes    map[int]*NodeInfo   `json:"nodes"`
+	RegionID string            `json:"regionId"`
+	Nodes    map[int]*NodeInfo `json:"nodes"`
 }
 
 type AggregatedStateResponse struct {
-	Topology *TopologyResponse       `json:"topology"`
-	Grids    map[string]*GridState   `json:"grids"`
+	Topology *TopologyResponse     `json:"topology"`
+	Grids    map[string]*GridState `json:"grids"`
 }
 
 type HaloResponse struct {
@@ -217,17 +216,16 @@ func NewController() *Controller {
 	c := &Controller{
 		registerChan:      make(chan *RegisterMessage, 200),
 		stateUpdateChan:   make(chan *StateUpdateMessage, 2000),
-		haloReadChan:      make(chan *HaloReadMessage, 1000),
 		webReadChan:       make(chan *WebReadMessage, 1000),
 		clickChan:         make(chan *ClickMessage, 100),
-		stepBroadcastChan: make(chan *StepBroadcastMessage, 1000),
+		disconnectChan:    make(chan *DisconnectMessage, 200),
+		manualStepChan:    make(chan struct{}, 1),
 		randomizeAllChan:  make(chan *RandomizeAllMessage, 10),
 		nodes:             make(map[int]*NodeInfo),
 		gridStates:        make(map[int]*GridState),
 		currentGeneration: 0,
 		regionID:          regionID,
 		readyEngines:      make(map[int]bool),
-		stepInProgress:    false,
 		barrierTimeout:    durationFromEnv("BARRIER_TIMEOUT", 1000*time.Millisecond),
 		stepInterval:      durationFromEnv("STEP_INTERVAL", 250*time.Millisecond),
 		lagThreshold:      intFromEnv("LAG_THRESHOLD", 2),
@@ -241,50 +239,54 @@ func NewController() *Controller {
 			},
 		},
 	}
-	
+
 	// Start the main message processor
 	go c.messageProcessor()
-	
-	// Start barrier coordinator
-	go c.barrierCoordinator()
-	
+
 	// Start health check timer
 	go c.healthChecker()
-	
+
 	return c
 }
 
 // Main message processing loop - all state mutations happen here
 func (c *Controller) messageProcessor() {
+	barrierTicker := time.NewTicker(25 * time.Millisecond)
+	defer barrierTicker.Stop()
+	lastStep := time.Now()
+
 	for {
 		select {
+		case <-barrierTicker.C:
+			if c.shouldStep(time.Since(lastStep)) {
+				lastStep = time.Now()
+				c.broadcastStepToAllEngines()
+			}
+
+		case <-c.manualStepChan:
+			lastStep = time.Now()
+			c.broadcastStepToAllEngines()
+
+		case msg := <-c.disconnectChan:
+			c.processDisconnect(msg.Position, msg.Conn)
+
 		case msg := <-c.registerChan:
 			atomic.AddInt64(&c.registerQueueSize, -1)
 			response := c.processRegister(msg.Request)
 			msg.Response <- response
-			
+
 		case msg := <-c.stateUpdateChan:
 			atomic.AddInt64(&c.stateUpdateQueueSize, -1)
-			err := c.processStateUpdate(msg.Position, msg.Request)
+			err := c.processStateUpdate(msg.Position, msg.Conn, msg.Request)
 			msg.Response <- err
-			
-		case msg := <-c.haloReadChan:
-			atomic.AddInt64(&c.haloReadQueueSize, -1)
-			response := c.processHaloRead(msg.Position)
-			msg.Response <- response
-			
+
 		case msg := <-c.webReadChan:
 			atomic.AddInt64(&c.webReadQueueSize, -1)
 			response := c.processWebRead(msg.Type)
 			msg.Response <- response
-			
+
 		case msg := <-c.clickChan:
 			err := c.processClick(msg.Request)
-			msg.Response <- err
-			
-		case msg := <-c.stepBroadcastChan:
-			atomic.AddInt64(&c.stepBroadcastQueueSize, -1)
-			err := c.processStepBroadcast(msg.Position)
 			msg.Response <- err
 
 		case msg := <-c.randomizeAllChan:
@@ -299,13 +301,23 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 	// Check if this pod is already registered
 	for pos, node := range c.nodes {
 		if node.PodID == req.PodID {
-			// Update heartbeat for existing registration
+			// Same engine reconnecting (or a duplicate): the newest socket wins,
+			// the slot is kept.
+			if node.Conn != nil && node.Conn != req.Conn {
+				node.Conn.close()
+			}
+			node.Conn = req.Conn
+			node.Connected = req.Conn != nil
+			node.Endpoint = req.Endpoint
+			if req.DisplayName != "" {
+				node.DisplayName = req.DisplayName
+			}
 			node.LastHeartbeat = time.Now()
-			log.Printf("Re-registered existing node %s at position %d", req.PodID, pos)
-			return RegisterResponse{Position: pos}
+			log.Printf("Engine %s reconnected at position %d", req.PodID, pos)
+			return RegisterResponse{Position: pos, Generation: atomic.LoadInt64(&c.currentGeneration)}
 		}
 	}
-	
+
 	// Find the free slot nearest the centre of the layout
 	position := -1
 	for _, slot := range c.slotOrder {
@@ -314,15 +326,15 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 			break
 		}
 	}
-	
+
 	if position == -1 {
 		return RegisterResponse{Position: -1} // Will handle error in handler
 	}
-	
+
 	// Convert position to row/col (10x10 grid layout)
 	row := position / gridCols
 	col := position % gridCols
-	
+
 	now := time.Now()
 	c.nodes[position] = &NodeInfo{
 		PodID:         req.PodID,
@@ -331,34 +343,52 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 		Endpoint:      req.Endpoint,
 		RegisteredAt:  now,
 		LastHeartbeat: now,
+		Conn:          req.Conn,
+		Connected:     req.Conn != nil,
 	}
-	
-	log.Printf("Registered node %s at position %d", req.PodID, position)
-	return RegisterResponse{Position: position}
+
+	log.Printf("Registered engine %s at position %d", req.PodID, position)
+	return RegisterResponse{Position: position, Generation: atomic.LoadInt64(&c.currentGeneration)}
 }
 
 // Process state update
-func (c *Controller) processStateUpdate(position int, req StateUpdateRequest) error {
+func (c *Controller) processStateUpdate(position int, conn *engineConn, req StateUpdateRequest) error {
+	node, exists := c.nodes[position]
+	if !exists || (conn != nil && node.Conn != conn) {
+		return fmt.Errorf("stale connection for position %d", position)
+	}
 	// Update grid state
 	c.gridStates[position] = &GridState{
 		Grid:       req.Grid,
 		Generation: req.Generation,
 		UpdatedAt:  time.Now(),
 	}
-	
+
 	// Update heartbeat for this node
 	if node, exists := c.nodes[position]; exists {
 		node.LastHeartbeat = time.Now()
 	}
-	
+
 	// Mark engine as ready for current generation (state post = readiness signal)
 	if req.Generation == int(c.currentGeneration) {
 		c.readyEngines[position] = true
-		log.Printf("Engine %d ready for generation %d (%d/%d ready)", 
+		log.Printf("Engine %d ready for generation %d (%d/%d ready)",
 			position, c.currentGeneration, len(c.readyEngines), len(c.nodes))
 	}
-	
+
 	return nil
+}
+
+// processDisconnect marks an engine's socket as gone. The slot is kept; the
+// miss budget removes the engine if it doesn't come back.
+func (c *Controller) processDisconnect(position int, conn *engineConn) {
+	node, exists := c.nodes[position]
+	if !exists || node.Conn != conn {
+		return // a newer socket already replaced this one
+	}
+	node.Conn = nil
+	node.Connected = false
+	log.Printf("Engine %s at position %d disconnected; holding slot", node.PodID, position)
 }
 
 // Process halo read request
@@ -384,16 +414,16 @@ func (c *Controller) processHaloRead(position int) HaloResponse {
 				// Edge cells come from neighbors - determine which neighbor and cell
 				var neighborPos int = -1
 				var nRow, nCol int
-				
+
 				if haloRow == 0 && haloCol >= 1 && haloCol <= 7 {
 					// North edge - neighbor is position - 10
 					if row > 0 {
 						neighborPos = (row-1)*10 + col
-						nRow = 6 // Get neighbor's south edge
+						nRow = 6           // Get neighbor's south edge
 						nCol = haloCol - 1 // Map halo col 1-7 to grid col 0-6
 					}
 				} else if haloRow == 8 && haloCol >= 1 && haloCol <= 7 {
-					// South edge - neighbor is position + 10  
+					// South edge - neighbor is position + 10
 					if row < 9 {
 						neighborPos = (row+1)*10 + col
 						nRow = 0 // Get neighbor's north edge
@@ -402,24 +432,43 @@ func (c *Controller) processHaloRead(position int) HaloResponse {
 				} else if haloCol == 0 && haloRow >= 1 && haloRow <= 7 {
 					// West edge - neighbor is position - 1
 					if col > 0 {
-						neighborPos = row*10 + (col-1)
+						neighborPos = row*10 + (col - 1)
 						nRow = haloRow - 1 // Map halo row 1-7 to grid row 0-6
-						nCol = 6 // Get neighbor's east edge
+						nCol = 6           // Get neighbor's east edge
 					}
 				} else if haloCol == 8 && haloRow >= 1 && haloRow <= 7 {
 					// East edge - neighbor is position + 1
 					if col < 9 {
-						neighborPos = row*10 + (col+1)
+						neighborPos = row*10 + (col + 1)
 						nRow = haloRow - 1
 						nCol = 0 // Get neighbor's west edge
 					}
+				} else {
+					// Corner: diagonal neighbour's opposite corner cell
+					dRow, dCol := -1, -1
+					if haloRow == 8 {
+						dRow = 1
+					}
+					if haloCol == 8 {
+						dCol = 1
+					}
+					if row+dRow >= 0 && row+dRow < gridRows && col+dCol >= 0 && col+dCol < gridCols {
+						neighborPos = (row+dRow)*gridCols + (col + dCol)
+						nRow, nCol = 0, 0
+						if dRow < 0 {
+							nRow = 6
+						}
+						if dCol < 0 {
+							nCol = 6
+						}
+					}
 				}
-				
+
 				// Get the cell from the neighbor if valid
 				if neighborPos >= 0 {
 					if state, exists := c.gridStates[neighborPos]; exists {
 						if nRow >= 0 && nRow < 7 && nCol >= 0 && nCol < 7 &&
-						   nRow < len(state.Grid) && nCol < len(state.Grid[nRow]) {
+							nRow < len(state.Grid) && nCol < len(state.Grid[nRow]) {
 							halo[haloRow][haloCol] = state.Grid[nRow][nCol]
 						}
 					}
@@ -438,7 +487,7 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 		return map[string]interface{}{
 			"generation": atomic.LoadInt64(&c.currentGeneration),
 		}
-		
+
 	case "aggregated-state":
 		// Copy node data
 		nodes := make(map[int]*NodeInfo)
@@ -459,7 +508,7 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 			},
 			Grids: grids,
 		}
-		
+
 	case "topology":
 		nodes := make(map[int]*NodeInfo)
 		for k, v := range c.nodes {
@@ -470,7 +519,7 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 			RegionID: c.regionID,
 			Nodes:    nodes,
 		}
-		
+
 	case "health":
 		return map[string]interface{}{
 			"status":      "healthy",
@@ -486,20 +535,20 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 				"stepBroadcast": atomic.LoadInt64(&c.stepBroadcastQueueSize),
 			},
 		}
-		
+
 	case "metrics":
 		// Metrics for web interface
 		webQueue := atomic.LoadInt64(&c.webReadQueueSize)
 		if webQueue < 0 {
 			webQueue = 0 // Fix negative queue bug
 		}
-		
+
 		return map[string]interface{}{
-			"timestamp":    time.Now().Unix(),
-			"regionId":     c.regionID,
-			"generation":   atomic.LoadInt64(&c.currentGeneration),
-			"nodes":        len(c.nodes),
-			"activeGrids":  len(c.gridStates),
+			"timestamp":   time.Now().Unix(),
+			"regionId":    c.regionID,
+			"generation":  atomic.LoadInt64(&c.currentGeneration),
+			"nodes":       len(c.nodes),
+			"activeGrids": len(c.gridStates),
 			"totalQueueSize": atomic.LoadInt64(&c.registerQueueSize) +
 				atomic.LoadInt64(&c.stateUpdateQueueSize) +
 				atomic.LoadInt64(&c.haloReadQueueSize) +
@@ -511,7 +560,7 @@ func (c *Controller) processWebRead(requestType string) interface{} {
 			"webQueueSize":   webQueue,
 			"stepQueueSize":  atomic.LoadInt64(&c.stepBroadcastQueueSize),
 		}
-		
+
 	default:
 		return nil
 	}
@@ -532,89 +581,47 @@ func (c *Controller) processClick(req ClickRequest) error {
 		return fmt.Errorf("no engine registered at grid position (%d, %d)", gridX, gridY)
 	}
 
-	log.Printf("Click at (%d,%d) targeting grid at position %d (engine %s at %s)",
-		req.GlobalX, req.GlobalY, position, node.PodID, node.Endpoint)
-
-	// Send randomize request to the target engine asynchronously
-	go c.sendRandomizeToEngine(position)
-
+	if node.Conn == nil {
+		return fmt.Errorf("engine at position %d is disconnected", position)
+	}
+	log.Printf("Click at (%d,%d): reseeding position %d (engine %s)", req.GlobalX, req.GlobalY, position, node.PodID)
+	node.Conn.enqueue(ctrlSimple{Type: "reseed"})
 	return nil
-}
-
-// sendRandomizeToEngine sends a POST /randomize to a specific engine
-func (c *Controller) sendRandomizeToEngine(position int) {
-	node, exists := c.nodes[position]
-	if !exists {
-		return
-	}
-
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(node.Endpoint+"/randomize", "application/json", nil)
-	if err != nil {
-		log.Printf("Failed to send randomize to engine %d: %v", position, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Engine %d rejected randomize: %d", position, resp.StatusCode)
-	}
 }
 
 // processRandomizeAll sends a POST /randomize to every registered engine.
 // Runs on the message processor goroutine; HTTP fan-out is dispatched in
 // goroutines so the processor isn't blocked.
 func (c *Controller) processRandomizeAll() int {
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	var wg sync.WaitGroup
-	var successCount int64
-
-	for position := range c.nodes {
-		wg.Add(1)
-		go func(pos int, endpoint string) {
-			defer wg.Done()
-			resp, err := client.Post(endpoint+"/randomize", "application/json", nil)
-			if err != nil {
-				log.Printf("Failed to randomize engine %d: %v", pos, err)
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				atomic.AddInt64(&successCount, 1)
-			}
-		}(position, c.nodes[position].Endpoint)
+	count := 0
+	for _, node := range c.nodes {
+		if node.Conn != nil && node.Conn.enqueue(ctrlSimple{Type: "reseed"}) {
+			count++
+		}
 	}
-
-	wg.Wait()
-	return int(successCount)
+	return count
 }
 
-// broadcastStepToAllEngines sends step signal to all registered engines
+// broadcastStepToAllEngines advances the generation and sends each connected
+// engine its step message with the full 9x9 halo. Runs on the processor
+// goroutine, so reading nodes/gridStates here is safe.
 func (c *Controller) broadcastStepToAllEngines() {
-	// Advance generation first
 	atomic.AddInt64(&c.currentGeneration, 1)
 	newGeneration := atomic.LoadInt64(&c.currentGeneration)
-	
-	log.Printf("Broadcasting step signal for generation %d to %d engines", newGeneration, len(c.nodes))
-	
-	// Track which engines didn't participate in the last step
+
 	c.updateMissedSteps()
-	
-	// Send step signal to all engines via HTTP
-	for position := range c.nodes {
-		go c.sendStepSignalToEngine(position)
+
+	for position, node := range c.nodes {
+		if node.Conn == nil {
+			continue
+		}
+		halo := c.processHaloRead(position).HaloCells
+		node.Conn.enqueue(ctrlStep{Type: "step", Generation: newGeneration, Halo: halo})
 	}
-	
-	// Clean up stale engines before next step
+
 	c.cleanupStaleEngines()
-	
-	// Broadcast updated state to WebSocket clients
 	c.broadcastToWebSocketClients()
-	
-	// Reset readiness tracking for next generation
 	c.readyEngines = make(map[int]bool)
-	c.stepInProgress = false
 }
 
 // updateMissedSteps increments missed step count for engines that didn't report ready
@@ -642,42 +649,15 @@ func (c *Controller) updateMissedSteps() {
 func (c *Controller) cleanupStaleEngines() {
 	for position, node := range c.nodes {
 		if node.MissedSteps >= c.staleThreshold {
-			log.Printf("Removing stale engine %s at position %d (missed %d steps)", 
+			log.Printf("Removing stale engine %s at position %d (missed %d steps)",
 				node.PodID, position, node.MissedSteps)
+			if node.Conn != nil {
+				node.Conn.close()
+			}
 			delete(c.nodes, position)
 			delete(c.gridStates, position)
 		}
 	}
-}
-
-// sendStepSignalToEngine sends step signal to a specific engine
-func (c *Controller) sendStepSignalToEngine(position int) {
-	node, exists := c.nodes[position]
-	if !exists {
-		return
-	}
-	
-	// Create HTTP client for step signal
-	client := &http.Client{Timeout: 2 * time.Second}
-	
-	// Send step signal to engine
-	url := fmt.Sprintf("%s/step", node.Endpoint)
-	resp, err := client.Post(url, "application/json", nil)
-	if err != nil {
-		log.Printf("Failed to send step signal to engine %d: %v", position, err)
-		return
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		log.Printf("Engine %d rejected step signal: %d", position, resp.StatusCode)
-	}
-}
-
-// processStepBroadcast handles step broadcast requests (if needed)
-func (c *Controller) processStepBroadcast(position int) error {
-	// This can be used for engine-initiated step requests if needed
-	return nil
 }
 
 // broadcastToWebSocketClients sends current aggregated state to all connected WebSocket clients
@@ -726,7 +706,7 @@ func (c *Controller) broadcastToWebSocketClients() {
 func (c *Controller) removeWebSocketClient(client *websocket.Conn) {
 	c.wsMutex.Lock()
 	defer c.wsMutex.Unlock()
-	
+
 	if _, exists := c.wsClients[client]; exists {
 		delete(c.wsClients, client)
 		client.Close()
@@ -734,53 +714,32 @@ func (c *Controller) removeWebSocketClient(client *websocket.Conn) {
 	}
 }
 
-// barrierCoordinator manages the barrier synchronization for distributed stepping.
-// It polls engine readiness at short intervals and broadcasts a step signal when
-// either all engines report ready (fast path) or the barrier timeout elapses
-// (slow path). Engines that don't report ready before the timeout are counted as
-// missing the step and may be cleaned up by cleanupStaleEngines.
-func (c *Controller) barrierCoordinator() {
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-
-	lastStep := time.Now()
-
-	for range ticker.C {
-		if c.stepInProgress || len(c.nodes) == 0 || c.steppingPaused {
+// shouldStep is the barrier decision: step when every connected, non-lagging
+// engine has reported for this generation and the fixed tick has elapsed, or
+// when the barrier timeout expires regardless.
+func (c *Controller) shouldStep(elapsed time.Duration) bool {
+	if c.steppingPaused || len(c.nodes) == 0 {
+		return false
+	}
+	expected := 0
+	for position, node := range c.nodes {
+		if node.Conn == nil && !c.readyEngines[position] {
+			continue // disconnected engines never hold the barrier
+		}
+		if node.Lagging && !c.readyEngines[position] {
 			continue
 		}
-
-		readyCount := len(c.readyEngines)
-		totalEngines := len(c.nodes)
-		elapsed := time.Since(lastStep)
-
-		// Lagging engines don't hold the barrier: the rest of the grid keeps
-		// its cadence and the laggard's section stays frozen until it catches up.
-		for position, node := range c.nodes {
-			if node.Lagging && !c.readyEngines[position] {
-				totalEngines--
-			}
-		}
-
-		// Fixed tick: never step faster than stepInterval, even if everyone is
-		// ready. Past the barrier timeout, step anyway and let laggards catch up.
-		allReady := readyCount >= totalEngines
-		if (allReady && elapsed >= c.stepInterval) || elapsed >= c.barrierTimeout {
-			log.Printf("Barrier sync: %d/%d engines ready (%v elapsed), broadcasting step for generation %d",
-				readyCount, totalEngines, elapsed.Round(time.Millisecond), c.currentGeneration)
-
-			c.stepInProgress = true
-			lastStep = time.Now()
-			go c.broadcastStepToAllEngines()
-		}
+		expected++
 	}
+	allReady := len(c.readyEngines) >= expected
+	return (allReady && elapsed >= c.stepInterval) || elapsed >= c.barrierTimeout
 }
 
 // healthChecker sends periodic health check messages
 func (c *Controller) healthChecker() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		// Send a health check message to clean up stale nodes
 		responseChan := make(chan interface{}, 1)
@@ -795,105 +754,6 @@ func (c *Controller) healthChecker() {
 
 // HTTP Handlers - these just queue messages and wait for responses
 
-// POST /register
-func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	responseChan := make(chan RegisterResponse, 1)
-	msg := &RegisterMessage{
-		Request:  req,
-		Response: responseChan,
-	}
-	
-	// Try to queue the message
-	select {
-	case c.registerChan <- msg:
-		atomic.AddInt64(&c.registerQueueSize, 1)
-		// Wait for response
-		response := <-responseChan
-		if response.Position == -1 {
-			http.Error(w, "Grid full", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	default:
-		// Queue full
-		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
-	}
-}
-
-// POST /state/{position}
-func (c *Controller) handleStateUpdate(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-
-	var req StateUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	responseChan := make(chan error, 1)
-	msg := &StateUpdateMessage{
-		Position: position,
-		Request:  req,
-		Response: responseChan,
-	}
-	
-	// Try to queue the message
-	select {
-	case c.stateUpdateChan <- msg:
-		atomic.AddInt64(&c.stateUpdateQueueSize, 1)
-		// Wait for response
-		if err := <-responseChan; err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	default:
-		// Queue full
-		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
-	}
-}
-
-// GET /halo/{position}
-func (c *Controller) handleHaloRequest(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	position, err := strconv.Atoi(vars["position"])
-	if err != nil {
-		http.Error(w, "Invalid position", http.StatusBadRequest)
-		return
-	}
-
-	responseChan := make(chan HaloResponse, 1)
-	msg := &HaloReadMessage{
-		Position: position,
-		Response: responseChan,
-	}
-	
-	// Try to queue the message
-	select {
-	case c.haloReadChan <- msg:
-		atomic.AddInt64(&c.haloReadQueueSize, 1)
-		// Wait for response
-		response := <-responseChan
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	default:
-		// Queue full
-		http.Error(w, "Controller overloaded", http.StatusServiceUnavailable)
-	}
-}
-
 // GET /generation
 func (c *Controller) handleGeneration(w http.ResponseWriter, r *http.Request) {
 	responseChan := make(chan interface{}, 1)
@@ -901,7 +761,7 @@ func (c *Controller) handleGeneration(w http.ResponseWriter, r *http.Request) {
 		Type:     "generation",
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.webReadChan <- msg:
@@ -923,7 +783,7 @@ func (c *Controller) handleAggregatedState(w http.ResponseWriter, r *http.Reques
 		Type:     "aggregated-state",
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.webReadChan <- msg:
@@ -945,7 +805,7 @@ func (c *Controller) handleTopology(w http.ResponseWriter, r *http.Request) {
 		Type:     "topology",
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.webReadChan <- msg:
@@ -967,13 +827,13 @@ func (c *Controller) handleClick(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	
+
 	responseChan := make(chan error, 1)
 	msg := &ClickMessage{
 		Request:  req,
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.clickChan <- msg:
@@ -1018,7 +878,7 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Type:     "health",
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.webReadChan <- msg:
@@ -1045,7 +905,7 @@ func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		Type:     "metrics",
 		Response: responseChan,
 	}
-	
+
 	// Try to queue the message
 	select {
 	case c.webReadChan <- msg:
@@ -1100,9 +960,9 @@ func (c *Controller) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) handleDebugPause(w http.ResponseWriter, r *http.Request) {
 	c.steppingPaused = true
 	log.Printf("DEBUG: Stepping paused at generation %d", atomic.LoadInt64(&c.currentGeneration))
-	
+
 	response := map[string]interface{}{
-		"status": "paused",
+		"status":     "paused",
 		"generation": atomic.LoadInt64(&c.currentGeneration),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1113,9 +973,9 @@ func (c *Controller) handleDebugPause(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) handleDebugUnpause(w http.ResponseWriter, r *http.Request) {
 	c.steppingPaused = false
 	log.Printf("DEBUG: Stepping unpaused at generation %d", atomic.LoadInt64(&c.currentGeneration))
-	
+
 	response := map[string]interface{}{
-		"status": "running",
+		"status":     "running",
 		"generation": atomic.LoadInt64(&c.currentGeneration),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1128,22 +988,15 @@ func (c *Controller) handleDebugNextStep(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Must be paused to use nextstep", http.StatusBadRequest)
 		return
 	}
-	
-	if c.stepInProgress {
-		http.Error(w, "Step already in progress", http.StatusConflict)
-		return
-	}
-	
-	log.Printf("DEBUG: Manual step requested at generation %d", atomic.LoadInt64(&c.currentGeneration))
-	c.stepInProgress = true
-	go c.broadcastStepToAllEngines()
-	
-	response := map[string]interface{}{
-		"status": "step_triggered",
-		"generation": atomic.LoadInt64(&c.currentGeneration) + 1,
+	select {
+	case c.manualStepChan <- struct{}{}:
+	default:
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "step_triggered",
+		"generation": atomic.LoadInt64(&c.currentGeneration) + 1,
+	})
 }
 
 // sendInitialState sends current aggregated state to a new WebSocket client
@@ -1186,24 +1039,22 @@ func main() {
 	r := mux.NewRouter()
 
 	// Core endpoints
-	r.HandleFunc("/register", controller.handleRegister).Methods("POST")
-	r.HandleFunc("/state/{position}", controller.handleStateUpdate).Methods("POST")
-	r.HandleFunc("/halo/{position}", controller.handleHaloRequest).Methods("GET")
+	r.HandleFunc("/engine", controller.handleEngineWS) // engines connect here (WebSocket)
 	r.HandleFunc("/generation", controller.handleGeneration).Methods("GET")
 	r.HandleFunc("/aggregated-state", controller.handleAggregatedState).Methods("GET")
 	r.HandleFunc("/topology", controller.handleTopology).Methods("GET")
 	r.HandleFunc("/api/click", controller.handleClick).Methods("POST")
 	r.HandleFunc("/health", controller.handleHealth).Methods("GET")
-	
+
 	// Legacy API mapping
 	r.HandleFunc("/api/grid", controller.handleApiGrid).Methods("GET")
-	
+
 	// Metrics endpoint for web interface
 	r.HandleFunc("/metrics", controller.handleMetrics).Methods("GET")
-	
+
 	// WebSocket endpoint for real-time updates
 	r.HandleFunc("/ws", controller.handleWebSocket)
-	
+
 	// Admin surface: never exposed publicly. Separate listener, separate port.
 	admin := mux.NewRouter()
 	admin.HandleFunc("/api/randomize", controller.handleRandomize).Methods("POST")
@@ -1228,8 +1079,5 @@ func main() {
 	log.Printf("Game of Life Controller with Channels starting on port %s (Region: %s)", port, controller.regionID)
 	log.Printf("Step interval %v, barrier timeout %v, lag after %d missed, remove after %d missed",
 		controller.stepInterval, controller.barrierTimeout, controller.lagThreshold, controller.staleThreshold)
-	log.Printf("Queue sizes: register=%d, stateUpdate=%d, haloRead=%d, webRead=%d",
-		cap(controller.registerChan), cap(controller.stateUpdateChan), 
-		cap(controller.haloReadChan), cap(controller.webReadChan))
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
 }

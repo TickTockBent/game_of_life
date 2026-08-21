@@ -1,7 +1,6 @@
 package gameoflife
 
 import (
-	"log"
 	"math/rand"
 )
 
@@ -10,35 +9,39 @@ const GridSize = 7
 type Cell bool
 
 type Grid struct {
-	Cells    [GridSize][GridSize]Cell
-	NextGen  [GridSize][GridSize]Cell
+	Cells      [GridSize][GridSize]Cell
+	NextGen    [GridSize][GridSize]Cell
 	Generation int
 	// Halo region for neighbor edge data
 	haloNorth []bool
 	haloSouth []bool
 	haloEast  []bool
 	haloWest  []bool
+	// Full 9x9 halo (our 7x7 in the centre, neighbours' edge cells around it,
+	// including diagonal corners). When set it takes precedence over the edges.
+	halo    [GridSize + 2][GridSize + 2]bool
+	haloSet bool
 	// Pre-allocated edge data structures to avoid allocations
 	edgeData map[string][]bool
 	// Pre-allocated state array for GetState() to avoid allocations
 	stateArray [][GridSize]bool
 	// Neighbor endpoints for communication
-	neighbors map[string]string
+	neighbors        map[string]string
 	crosstalkEnabled bool
 	// Staleness detection
 	emptyGenerations int
 	boringThreshold  int
-	
+
 	// Oscillation detection - store last few states
-	stateHistory [][GridSize][GridSize]Cell
-	historyIndex int
-	historySize  int
-	stableGenerations int
+	stateHistory         [][GridSize][GridSize]Cell
+	historyIndex         int
+	historySize          int
+	stableGenerations    int
 	oscillationThreshold int
-	
+
 	// Low activity detection
-	lastChangedCells int
-	lowActivityThreshold int
+	lastChangedCells       int
+	lowActivityThreshold   int
 	lowActivityGenerations int
 }
 
@@ -49,28 +52,28 @@ func NewGrid() *Grid {
 	edgeData["south"] = make([]bool, GridSize)
 	edgeData["east"] = make([]bool, GridSize)
 	edgeData["west"] = make([]bool, GridSize)
-	
+
 	// Initialize state history for oscillation detection
 	historySize := 5 // Track last 5 states to detect cycles
 	stateHistory := make([][GridSize][GridSize]Cell, historySize)
-	
+
 	return &Grid{
-		neighbors: make(map[string]string),
+		neighbors:        make(map[string]string),
 		crosstalkEnabled: false,
-		boringThreshold: 1000, // Auto-randomize after 1000 empty generations
-		edgeData: edgeData,
+		boringThreshold:  40, // An empty section re-seeds after ~10s; nothing to watch otherwise
+		edgeData:         edgeData,
 		// Pre-allocate halo regions too
 		haloNorth: make([]bool, GridSize),
 		haloSouth: make([]bool, GridSize),
 		haloEast:  make([]bool, GridSize),
 		haloWest:  make([]bool, GridSize),
-		// Pre-allocate state array 
+		// Pre-allocate state array
 		stateArray: make([][GridSize]bool, GridSize),
 		// Staleness detection
-		stateHistory: stateHistory,
-		historySize: historySize,
-		oscillationThreshold: 200, // Detect stable patterns after 200 generations
-		lowActivityThreshold: 3,   // Less than 3 cells changing = low activity
+		stateHistory:           stateHistory,
+		historySize:            historySize,
+		oscillationThreshold:   120, // ~30s at 4 gen/s of a still life / oscillator
+		lowActivityThreshold:   3,   // Less than 3 cells changing = low activity
 		lowActivityGenerations: 0,
 	}
 }
@@ -82,6 +85,94 @@ func (g *Grid) RandomSeed(probability float64) {
 		}
 	}
 	g.Generation = 0
+}
+
+// Patterns that stay interesting on a 7x7 section and tend to spill into
+// neighbours (which is the whole point of a distributed grid).
+var seedPatterns = [][]string{
+	{".XX", "XX.", ".X."},                // R-pentomino: chaotic for ~1100 generations
+	{".X.", "..X", "XXX"},                // glider
+	{".X.....", "...X...", "XX..XXX"},    // acorn (7 wide, fits exactly)
+	{".X..X", "X....", "X...X", "XXXX."}, // lightweight spaceship
+	{"XXX", "X..", ".X."},                // a small "B-heptomino"-ish seed
+}
+
+// SeedPattern clears the section and drops a random pattern at a random
+// offset and orientation. Falls back to 30% noise one time in five so the
+// grid doesn't look too curated.
+func (g *Grid) SeedPattern() {
+	if rand.Intn(5) == 0 {
+		g.RandomSeed(0.3)
+		return
+	}
+	shape := patternCells(seedPatterns[rand.Intn(len(seedPatterns))])
+	for turns := rand.Intn(4); turns > 0; turns-- {
+		shape = rotateCells(shape)
+	}
+	if rand.Intn(2) == 1 {
+		shape = flipCells(shape)
+	}
+	shape, height, width := normaliseCells(shape)
+	offR := rand.Intn(GridSize - height + 1)
+	offC := rand.Intn(GridSize - width + 1)
+	g.Cells = [GridSize][GridSize]Cell{}
+	for _, cell := range shape {
+		g.Cells[cell[0]+offR][cell[1]+offC] = true
+	}
+	g.Generation = 0
+}
+
+func patternCells(pattern []string) [][2]int {
+	cells := make([][2]int, 0, 16)
+	for r, row := range pattern {
+		for c := 0; c < len(row); c++ {
+			if row[c] == 'X' {
+				cells = append(cells, [2]int{r, c})
+			}
+		}
+	}
+	return cells
+}
+
+func rotateCells(cells [][2]int) [][2]int { // 90 degrees: (r,c) -> (c,-r)
+	out := make([][2]int, len(cells))
+	for i, cell := range cells {
+		out[i] = [2]int{cell[1], -cell[0]}
+	}
+	return out
+}
+
+func flipCells(cells [][2]int) [][2]int {
+	out := make([][2]int, len(cells))
+	for i, cell := range cells {
+		out[i] = [2]int{cell[0], -cell[1]}
+	}
+	return out
+}
+
+// normaliseCells shifts a shape so its top-left is (0,0) and returns its size.
+func normaliseCells(cells [][2]int) ([][2]int, int, int) {
+	minR, minC := cells[0][0], cells[0][1]
+	for _, cell := range cells {
+		if cell[0] < minR {
+			minR = cell[0]
+		}
+		if cell[1] < minC {
+			minC = cell[1]
+		}
+	}
+	maxR, maxC := 0, 0
+	out := make([][2]int, len(cells))
+	for i, cell := range cells {
+		out[i] = [2]int{cell[0] - minR, cell[1] - minC}
+		if out[i][0] > maxR {
+			maxR = out[i][0]
+		}
+		if out[i][1] > maxC {
+			maxC = out[i][1]
+		}
+	}
+	return out, maxR + 1, maxC + 1
 }
 
 func (g *Grid) SetCell(x, y int, alive bool) {
@@ -105,7 +196,7 @@ func (g *Grid) countNeighbors(x, y int) int {
 				continue
 			}
 			nx, ny := x+dx, y+dy
-			
+
 			// Check if neighbor is within grid bounds
 			if nx >= 0 && nx < GridSize && ny >= 0 && ny < GridSize {
 				if g.Cells[nx][ny] {
@@ -122,48 +213,28 @@ func (g *Grid) countNeighbors(x, y int) int {
 	return count
 }
 
-// checkHaloNeighbor checks if a neighbor outside the grid is alive in halo region
+// checkHaloNeighbor reports whether a neighbour just outside the grid is alive.
 func (g *Grid) checkHaloNeighbor(x, y int) bool {
-	// Note: This function is called from within countNeighbors which is already under mu.Lock()
-	// So we don't need additional locking here - the halo data is protected by the existing lock
-	
-	// North halo (x = -1)
-	if x == -1 && y >= 0 && y < GridSize && g.haloNorth != nil {
-		result := g.haloNorth[y]
-		// Log only first few calls to avoid spam
-		if g.Generation < 30 {
-			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - north halo[%d] = %v", x, y, y, result)
-		}
-		return result
+	if g.haloSet {
+		return g.halo[x+1][y+1]
 	}
-	// South halo (x = GridSize)
-	if x == GridSize && y >= 0 && y < GridSize && g.haloSouth != nil {
-		result := g.haloSouth[y]
-		if g.Generation < 30 {
-			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - south halo[%d] = %v", x, y, y, result)
-		}
-		return result
-	}
-	// West halo (y = -1)
-	if y == -1 && x >= 0 && x < GridSize && g.haloWest != nil {
-		result := g.haloWest[x]
-		if g.Generation < 30 {
-			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - west halo[%d] = %v", x, y, x, result)
-		}
-		return result
-	}
-	// East halo (y = GridSize)
-	if y == GridSize && x >= 0 && x < GridSize && g.haloEast != nil {
-		result := g.haloEast[x]
-		if g.Generation < 30 {
-			log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - east halo[%d] = %v", x, y, x, result)
-		}
-		return result
-	}
-	if g.Generation < 30 {
-		log.Printf("DEBUG: checkHaloNeighbor(%d,%d) - no halo match, returning false", x, y)
+	switch {
+	case x == -1 && y >= 0 && y < GridSize && g.haloNorth != nil:
+		return g.haloNorth[y]
+	case x == GridSize && y >= 0 && y < GridSize && g.haloSouth != nil:
+		return g.haloSouth[y]
+	case y == -1 && x >= 0 && x < GridSize && g.haloWest != nil:
+		return g.haloWest[x]
+	case y == GridSize && x >= 0 && x < GridSize && g.haloEast != nil:
+		return g.haloEast[x]
 	}
 	return false
+}
+
+// SetHalo installs the full 9x9 neighbourhood for the next generation.
+func (g *Grid) SetHalo(halo [GridSize + 2][GridSize + 2]bool) {
+	g.halo = halo
+	g.haloSet = true
 }
 
 // ComputeNextGeneration calculates the next generation but doesn't commit it yet
@@ -171,7 +242,7 @@ func (g *Grid) ComputeNextGeneration() {
 	for x := 0; x < GridSize; x++ {
 		for y := 0; y < GridSize; y++ {
 			neighbors := g.countNeighbors(x, y)
-			
+
 			// Apply Conway's Game of Life rules
 			if g.Cells[x][y] {
 				g.NextGen[x][y] = neighbors == 2 || neighbors == 3
@@ -186,14 +257,14 @@ func (g *Grid) ComputeNextGeneration() {
 func (g *Grid) CommitNextGeneration() {
 	// Count cells that changed this generation
 	changedCells := g.countChangedCells()
-	
+
 	// Store current state in history for oscillation detection
 	g.storeCurrentState()
-	
+
 	// Copy NextGen to Cells and increment generation
 	g.Cells = g.NextGen
 	g.Generation++
-	
+
 	// Update staleness tracking
 	g.updateStalenessDetection(changedCells)
 }
@@ -206,12 +277,12 @@ func (g *Grid) NextGeneration() {
 
 // Legacy implementation for reference (now replaced by ComputeNextGeneration)
 func (g *Grid) nextGenerationLegacy() {
-	
+
 	for x := 0; x < GridSize; x++ {
 		for y := 0; y < GridSize; y++ {
 			neighbors := g.countNeighbors(x, y)
 			alive := g.Cells[x][y]
-			
+
 			if alive && (neighbors == 2 || neighbors == 3) {
 				g.NextGen[x][y] = true
 			} else if !alive && neighbors == 3 {
@@ -221,10 +292,10 @@ func (g *Grid) nextGenerationLegacy() {
 			}
 		}
 	}
-	
+
 	g.Cells = g.NextGen
 	g.Generation++
-	
+
 	// Check for boring threshold
 	if g.isEmpty() {
 		g.emptyGenerations++
@@ -276,7 +347,7 @@ func (g *Grid) GetEdgeCells() map[string][]bool {
 	south := g.edgeData["south"]
 	east := g.edgeData["east"]
 	west := g.edgeData["west"]
-	
+
 	// Just overwrite the existing slice contents
 	for i := 0; i < GridSize; i++ {
 		north[i] = bool(g.Cells[0][i])
@@ -284,7 +355,7 @@ func (g *Grid) GetEdgeCells() map[string][]bool {
 		west[i] = bool(g.Cells[i][0])
 		east[i] = bool(g.Cells[i][GridSize-1])
 	}
-	
+
 	// Return the same map each time (no new allocation)
 	return g.edgeData
 }
@@ -335,34 +406,34 @@ func (g *Grid) updateStalenessDetection(changedCells int) {
 	if g.isEmpty() {
 		g.emptyGenerations++
 		if g.emptyGenerations >= g.boringThreshold {
-			g.RandomSeed(0.3) // Auto-randomize when boring
+			g.SeedPattern() // Auto-reseed when boring
 			g.resetStalenessCounters()
 			return
 		}
 	} else {
 		g.emptyGenerations = 0
 	}
-	
+
 	// Low activity detection
 	if changedCells <= g.lowActivityThreshold {
 		g.lowActivityGenerations++
 	} else {
 		g.lowActivityGenerations = 0
 	}
-	
+
 	// Oscillation detection
 	if g.Generation > g.historySize && g.isOscillating() {
 		g.stableGenerations++
 	} else {
 		g.stableGenerations = 0
 	}
-	
+
 	// Trigger randomization if stale
 	if g.isStale() {
-		g.RandomSeed(0.3)
+		g.SeedPattern()
 		g.resetStalenessCounters()
 	}
-	
+
 	g.lastChangedCells = changedCells
 }
 
@@ -394,15 +465,15 @@ func (g *Grid) statesEqual(state1, state2 [GridSize][GridSize]Cell) bool {
 // isStale determines if the grid should be randomized based on multiple criteria
 func (g *Grid) isStale() bool {
 	// Stale if low activity for too long
-	if g.lowActivityGenerations >= 300 { // 300 generations of minimal change
+	if g.lowActivityGenerations >= 160 { // ~40s at 4 gen/s of barely anything changing
 		return true
 	}
-	
+
 	// Stale if oscillating for too long
 	if g.stableGenerations >= g.oscillationThreshold {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -422,10 +493,10 @@ func (g *Grid) resetStalenessCounters() {
 // GetStalenessInfo returns current staleness detection state for debugging/monitoring
 func (g *Grid) GetStalenessInfo() map[string]int {
 	return map[string]int{
-		"emptyGenerations":      g.emptyGenerations,
+		"emptyGenerations":       g.emptyGenerations,
 		"lowActivityGenerations": g.lowActivityGenerations,
-		"stableGenerations":     g.stableGenerations,
-		"lastChangedCells":      g.lastChangedCells,
-		"generation":           g.Generation,
+		"stableGenerations":      g.stableGenerations,
+		"lastChangedCells":       g.lastChangedCells,
+		"generation":             g.Generation,
 	}
 }

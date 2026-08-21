@@ -1,472 +1,197 @@
+// Game of Life engine: owns one 7x7 section of the shared grid.
+//
+// The engine opens a single WebSocket to the controller and never listens on
+// anything, so it runs unchanged on a compose network, a laptop behind NAT, or
+// a Raspberry Pi on someone's shelf. Protocol in cmd/controller/engine_ws.go.
+//
+//	CONTROLLER_URL  ws(s) URL of the controller's /engine endpoint
+//	DISPLAY_NAME    optional name shown on the public page
+//	ENGINE_ID       optional stable id (default: hostname)
 package main
 
 import (
-	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
-	"net/http"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/ticktockbent/game_of_life/pkg/gameoflife"
 )
 
+const (
+	protocolVersion = 1
+	readTimeout     = 90 * time.Second // controller pings every 30s
+	writeTimeout    = 5 * time.Second
+	reconnectMin    = 1 * time.Second
+	reconnectMax    = 30 * time.Second
+	defaultControl  = "wss://gameoflife-api.wshoffner.dev/engine"
+)
+
 type Engine struct {
-	grid      *gameoflife.Grid
-	nodeID    string
-	controllerURL string
-	position  int
-	registered bool
-	httpClient *http.Client
-	stopChan   chan struct{}
-	stepChan   chan struct{} // Channel to receive step signals
-	failedPushes int         // Count of consecutive failed state pushes
-	lastStepSignal time.Time // When the controller last told us to step
+	grid        *gameoflife.Grid
+	engineID    string
+	displayName string
+	controlURL  string
+	position    int
+	generation  int64 // controller generation we last stepped to
 }
 
-// stepSignalTimeout is how long an engine tolerates silence from the
-// controller before assuming its registration was lost. The controller's
-// barrier timeout is 1s, so 10s of silence is unambiguous.
-const stepSignalTimeout = 10 * time.Second
+// Wire types (mirror cmd/controller/engine_ws.go)
+type helloMsg struct {
+	Type        string `json:"type"`
+	EngineID    string `json:"engineId"`
+	DisplayName string `json:"displayName"`
+	Version     int    `json:"version"`
+}
 
-type HaloResponse struct {
-	HaloCells [9][9]bool `json:"haloCells"`
+type stateMsg struct {
+	Type       string   `json:"type"`
+	Generation int64    `json:"generation"`
+	Grid       [][]bool `json:"grid"`
+}
+
+type controlMsg struct {
+	Type       string     `json:"type"`
+	Position   int        `json:"position"`
+	Row        int        `json:"row"`
+	Col        int        `json:"col"`
+	Generation int64      `json:"generation"`
+	Halo       [9][9]bool `json:"halo"`
+	Reason     string     `json:"reason"`
 }
 
 func NewEngine() *Engine {
-	// Get unique pod identifier
-	// Prefer the Kubernetes pod name; otherwise fall back to the container
-	// hostname (unique per container under docker compose --scale).
-	podName := os.Getenv("POD_NAME")
-	var nodeID string
-	if podName != "" && len(podName) >= 5 {
-		nodeID = podName[len(podName)-5:]
-	} else if hostname, err := os.Hostname(); err == nil && hostname != "" {
-		nodeID = hostname
-	} else {
-		nodeID = "test"
+	engineID := os.Getenv("ENGINE_ID")
+	if engineID == "" {
+		if hostname, err := os.Hostname(); err == nil && hostname != "" {
+			engineID = hostname
+		} else {
+			engineID = "engine"
+		}
+	}
+	controlURL := os.Getenv("CONTROLLER_URL")
+	if controlURL == "" {
+		controlURL = defaultControl
+	}
+	// Accept a bare http(s) base URL too, for convenience.
+	controlURL = strings.Replace(controlURL, "http://", "ws://", 1)
+	controlURL = strings.Replace(controlURL, "https://", "wss://", 1)
+	if !strings.HasSuffix(controlURL, "/engine") {
+		controlURL = strings.TrimRight(controlURL, "/") + "/engine"
 	}
 
-	// Use external controller URL
-	controllerURL := os.Getenv("CONTROLLER_URL")
-	if controllerURL == "" {
-		controllerURL = "https://gameoflife-api.ticktockbent.com"
-	}
+	grid := gameoflife.NewGrid()
+	grid.SeedPattern()
 
-	log.Printf("DEBUG: Creating HTTP client with 5s timeout")
-	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			DisableKeepAlives:   true,  // Theory 2: Disable connection reuse
-			MaxIdleConns:        0,     // Theory 2: No connection pooling
-			IdleConnTimeout:     0,     // Theory 2: No idle connections
-			TLSHandshakeTimeout: 3 * time.Second, // Theory 1: Longer TLS timeout
-			DialContext: (&net.Dialer{
-				Timeout: 3 * time.Second, // Theory 3: Longer dial timeout
-			}).DialContext,
-		},
-	}
-
-	engine := &Engine{
-		grid:          gameoflife.NewGrid(),
-		nodeID:        nodeID,
-		controllerURL: controllerURL,
-		position:      -1,
-		httpClient:    httpClient,
-		stopChan:      make(chan struct{}),
-		stepChan:      make(chan struct{}, 10), // Buffered channel for step signals
-	}
-
-	// Randomize initial state
-	engine.grid.RandomSeed(0.3)
-
-	return engine
-}
-
-// Start begins the engine lifecycle
-func (e *Engine) Start() {
-	log.Printf("Starting engine %s with router URL: %s", e.nodeID, e.controllerURL)
-	
-	// 1. Register with controller
-	e.register()
-	
-	// 2. Start autonomous game loop
-	go e.gameLoop()
-	
-	// 3. Start HTTP server for health checks
-	go e.startHTTPServer()
-}
-
-// register with router to get position (router forwards to controller)
-func (e *Engine) register() {
-	for !e.registered {
-		log.Printf("Attempting registration to %s/register", e.controllerURL)
-		
-		// Get pod IP for endpoint registration. Under Kubernetes POD_IP is
-		// injected; under docker compose we resolve our own routable address.
-		podIP := os.Getenv("POD_IP")
-		if podIP == "" {
-			podIP = detectOwnIP()
-		}
-		
-		reqData := map[string]string{
-			"podId":    e.nodeID,
-			"endpoint": fmt.Sprintf("http://%s:8080", podIP),
-		}
-		
-		jsonData, _ := json.Marshal(reqData)
-		start := time.Now()
-		resp, err := e.httpClient.Post(e.controllerURL+"/register", "application/json", strings.NewReader(string(jsonData)))
-		elapsed := time.Since(start)
-		if err != nil {
-			log.Printf("Registration failed after %v: %v (Type: %T)", elapsed, err, err)
-			if netErr, ok := err.(net.Error); ok {
-				log.Printf("DEBUG: Network error during registration - Timeout: %v, Temporary: %v", netErr.Timeout(), netErr.Temporary())
-			}
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != 200 {
-			log.Printf("Registration rejected: %d", resp.StatusCode)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		
-		var regResp map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&regResp); err != nil {
-			log.Printf("Failed to parse registration response: %v", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		
-		if pos, ok := regResp["position"].(float64); ok {
-			e.position = int(pos)
-			e.registered = true
-			e.lastStepSignal = time.Now()
-			log.Printf("Registered at position %d", e.position)
-			
-			// Get current controller generation and sync with it
-			if controllerGen, err := e.getControllerGeneration(); err == nil {
-				e.grid.Generation = controllerGen
-				log.Printf("Synced to controller generation %d", controllerGen)
-			}
-			
-			// Push initial state (signals readiness for current generation)
-			e.pushState()
-		}
+	return &Engine{
+		grid:        grid,
+		engineID:    engineID,
+		displayName: os.Getenv("DISPLAY_NAME"),
+		controlURL:  controlURL,
+		position:    -1,
 	}
 }
 
-// gameLoop runs the barrier-synchronized Conway's Game of Life
-func (e *Engine) gameLoop() {
-	log.Printf("Starting barrier sync game loop for engine %s", e.nodeID)
-	
+// Run connects, serves one session, and reconnects with backoff forever.
+// The grid survives reconnects, so a network blip doesn't reset the section.
+func (e *Engine) Run() {
+	backoff := reconnectMin
 	for {
-		select {
-		case <-e.stopChan:
-			return
-		case <-e.stepChan:
-			if e.registered {
-				// Execute synchronized step
-				e.executeStep()
-			}
-		default:
-			if !e.registered {
-				// Lost registration (controller restart, network blip): register again.
-				e.register()
-				continue
-			}
-			// Watchdog: a healthy controller steps at least once per barrier
-			// timeout. If we've heard nothing for stepSignalTimeout, assume the
-			// controller forgot us (e.g. it restarted) and re-register.
-			if !e.lastStepSignal.IsZero() && time.Since(e.lastStepSignal) > stepSignalTimeout {
-				log.Printf("Engine %s: no step signal for %v, re-registering", e.nodeID, stepSignalTimeout)
-				e.registered = false
-				continue
-			}
-			// Wait for step signal - no busy loop
-			time.Sleep(100 * time.Millisecond)
+		err := e.session()
+		log.Printf("Session ended: %v — reconnecting in %v", err, backoff)
+		time.Sleep(backoff + time.Duration(rand.Int63n(int64(backoff/2))))
+		backoff *= 2
+		if backoff > reconnectMax {
+			backoff = reconnectMax
 		}
 	}
 }
 
-// executeStep performs one synchronized game iteration when signaled by controller
-func (e *Engine) executeStep() {
-	log.Printf("Engine %s executing step", e.nodeID)
-	
-	// 1. Get current controller generation
-	controllerGen, err := e.getControllerGeneration()
+func (e *Engine) session() error {
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	ws, _, err := dialer.Dial(e.controlURL, nil)
 	if err != nil {
-		log.Printf("Failed to get controller generation: %v", err)
-		return
+		return err
 	}
-	
-	// 2. Get halo data from controller
-	haloData, err := e.getHalo()
-	if err != nil {
-		log.Printf("Failed to get halo: %v", err)
-		return
-	}
-	
-	// 3. Apply halo data to grid for border cell computation
-	e.applyHaloToGrid(haloData)
-	
-	// 4. Compute next generation with neighbor data
-	e.grid.ComputeNextGeneration()
-	e.grid.CommitNextGeneration()
-	
-	// 4. Sync our generation with controller
-	e.grid.Generation = controllerGen
-	
-	// 5. Push new state to controller (this signals readiness for next generation)
-	e.pushState()
-	
-	log.Printf("Engine %s completed step for generation %d", e.nodeID, controllerGen)
-}
+	defer ws.Close()
 
-// applyHaloToGrid extracts directional edges from 9x9 halo and applies them to the grid
-func (e *Engine) applyHaloToGrid(halo [9][9]bool) {
-	// Enable crosstalk by setting dummy neighbors (actual neighbors handled by controller)
-	e.grid.SetNeighbors(map[string]string{
-		"north": "controller",
-		"south": "controller", 
-		"east": "controller",
-		"west": "controller",
+	if err := e.write(ws, helloMsg{Type: "hello", EngineID: e.engineID, DisplayName: e.displayName, Version: protocolVersion}); err != nil {
+		return err
+	}
+
+	ws.SetReadDeadline(time.Now().Add(readTimeout))
+	ws.SetPingHandler(func(data string) error {
+		ws.SetReadDeadline(time.Now().Add(readTimeout))
+		ws.SetWriteDeadline(time.Now().Add(writeTimeout))
+		return ws.WriteMessage(websocket.PongMessage, []byte(data))
 	})
-	
-	// Extract directional edges from 9x9 halo:
-	// - Row 0: North neighbors  
-	// - Row 8: South neighbors
-	// - Col 0: West neighbors
-	// - Col 8: East neighbors
-	
-	// North edge (top row of halo, cols 1-7 map to our grid cols 0-6)
-	northData := make([]bool, 7)
-	for i := 0; i < 7; i++ {
-		northData[i] = halo[0][i+1]
-	}
-	e.grid.UpdateHaloRegion("north", northData)
-	log.Printf("DEBUG: Engine %s set north halo: %v", e.nodeID, northData)
-	
-	// South edge (bottom row of halo, cols 1-7 map to our grid cols 0-6)  
-	southData := make([]bool, 7)
-	for i := 0; i < 7; i++ {
-		southData[i] = halo[8][i+1]
-	}
-	e.grid.UpdateHaloRegion("south", southData)
-	
-	// West edge (left column of halo, rows 1-7 map to our grid rows 0-6)
-	westData := make([]bool, 7)
-	for i := 0; i < 7; i++ {
-		westData[i] = halo[i+1][0]
-	}
-	e.grid.UpdateHaloRegion("west", westData)
-	
-	// East edge (right column of halo, rows 1-7 map to our grid rows 0-6)
-	eastData := make([]bool, 7)
-	for i := 0; i < 7; i++ {
-		eastData[i] = halo[i+1][8]
-	}
-	e.grid.UpdateHaloRegion("east", eastData)
-	log.Printf("DEBUG: Engine %s set east halo: %v", e.nodeID, eastData)
-	
-	log.Printf("Applied halo data to grid - crosstalk enabled")
-}
 
-// getHalo fetches surrounding cells from controller
-func (e *Engine) getHalo() ([9][9]bool, error) {
-	var halo [9][9]bool
-	
-	url := fmt.Sprintf("%s/halo/%d", e.controllerURL, e.position)
-	resp, err := e.httpClient.Get(url)
-	if err != nil {
-		return halo, err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return halo, fmt.Errorf("status %d", resp.StatusCode)
-	}
-	
-	var haloResp HaloResponse
-	err = json.NewDecoder(resp.Body).Decode(&haloResp)
-	return haloResp.HaloCells, err
-}
-
-// getControllerGeneration fetches current generation from router
-func (e *Engine) getControllerGeneration() (int, error) {
-	url := fmt.Sprintf("%s/generation", e.controllerURL)
-	log.Printf("DEBUG: Attempting to GET %s", url)
-	
-	start := time.Now()
-	resp, err := e.httpClient.Get(url)
-	elapsed := time.Since(start)
-	
-	if err != nil {
-		log.Printf("DEBUG: HTTP GET failed after %v: %v (Type: %T)", elapsed, err, err)
-		if netErr, ok := err.(net.Error); ok {
-			log.Printf("DEBUG: Network error - Timeout: %v, Temporary: %v", netErr.Timeout(), netErr.Temporary())
+	for {
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			return err
 		}
-		return 0, err
-	}
-	defer resp.Body.Close()
+		ws.SetReadDeadline(time.Now().Add(readTimeout))
 
-	log.Printf("DEBUG: HTTP GET succeeded after %v, status: %d", elapsed, resp.StatusCode)
-
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var genResp map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
-		return 0, err
-	}
-
-	if gen, ok := genResp["generation"].(float64); ok {
-		return int(gen), nil
-	}
-	
-	return 0, fmt.Errorf("invalid generation response")
-}
-
-// pushState sends current grid to controller
-func (e *Engine) pushState() {
-	// Convert grid to [][]bool
-	gridState := make([][]bool, gameoflife.GridSize)
-	for i := range gridState {
-		gridState[i] = make([]bool, gameoflife.GridSize)
-		for j := range gridState[i] {
-			gridState[i][j] = bool(e.grid.Cells[i][j])
+		var msg controlMsg
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
 		}
-	}
-	
-	stateData := map[string]interface{}{
-		"grid":       gridState,
-		"generation": e.grid.Generation,
-	}
-	
-	jsonData, _ := json.Marshal(stateData)
-	url := fmt.Sprintf("%s/state/%d", e.controllerURL, e.position)
-	resp, err := e.httpClient.Post(url, "application/json", strings.NewReader(string(jsonData)))
-	if err != nil {
-		log.Printf("Failed to push state: %v", err)
-		e.failedPushes++
-		e.checkReregistration()
-		return
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		log.Printf("State push rejected: %d", resp.StatusCode)
-		e.failedPushes++
-		e.checkReregistration()
-		return
-	}
-	
-	// Success - reset failure counter
-	e.failedPushes = 0
-}
-
-// checkReregistration triggers re-registration if too many pushes have failed
-func (e *Engine) checkReregistration() {
-	if e.failedPushes >= 3 {
-		log.Printf("Engine %s failed %d consecutive state pushes, re-registering", e.nodeID, e.failedPushes)
-		e.registered = false
-		e.position = -1
-		e.failedPushes = 0
-		// Registration will happen in the next game loop iteration
-	}
-}
-
-// startHTTPServer provides health check and step signal endpoints
-func (e *Engine) startHTTPServer() {
-	r := mux.NewRouter()
-	r.HandleFunc("/health", e.handleHealth).Methods("GET")
-	r.HandleFunc("/step", e.handleStep).Methods("POST")
-	r.HandleFunc("/randomize", e.handleRandomize).Methods("POST")
-
-	port := "8080"
-	log.Printf("HTTP server starting on port %s", port)
-	http.ListenAndServe(":"+port, r)
-}
-
-// handleHealth returns simple health check
-func (e *Engine) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := map[string]interface{}{
-		"status":     "healthy",
-		"nodeId":     e.nodeID,
-		"registered": e.registered,
-		"position":   e.position,
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
-}
-
-// handleStep receives step signal from controller
-func (e *Engine) handleStep(w http.ResponseWriter, r *http.Request) {
-	if !e.registered {
-		http.Error(w, "Engine not registered", http.StatusServiceUnavailable)
-		return
-	}
-	
-	e.lastStepSignal = time.Now()
-
-	// Send step signal to game loop
-	select {
-	case e.stepChan <- struct{}{}:
-		w.WriteHeader(http.StatusOK)
-		log.Printf("Engine %s received step signal", e.nodeID)
-	default:
-		// Channel full, step already queued
-		w.WriteHeader(http.StatusOK)
-		log.Printf("Engine %s step signal already queued", e.nodeID)
-	}
-}
-
-// handleRandomize reseeds the grid with random live cells and resets generation.
-// Called by the web frontend (via controller click-to-randomize) so a user can
-// inject new patterns into a specific grid section.
-func (e *Engine) handleRandomize(w http.ResponseWriter, r *http.Request) {
-	e.grid.RandomSeed(0.3)
-	log.Printf("Engine %s randomized grid at position %d", e.nodeID, e.position)
-
-	// Push new state immediately so the controller reflects the change promptly
-	go e.pushState()
-
-	w.WriteHeader(http.StatusOK)
-}
-
-// detectOwnIP returns the first non-loopback IPv4 address of this host, so
-// the controller can reach this engine's /step and /randomize endpoints.
-// Falls back to "localhost" when nothing usable is found.
-func detectOwnIP() string {
-	interfaceAddrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, addr := range interfaceAddrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok || ipNet.IP.IsLoopback() {
-				continue
+		switch msg.Type {
+		case "assigned":
+			e.position = msg.Position
+			e.generation = msg.Generation
+			log.Printf("Assigned position %d (row %d, col %d) at generation %d", msg.Position, msg.Row, msg.Col, msg.Generation)
+			// Show our current section straight away and count as ready.
+			if err := e.sendState(ws); err != nil {
+				return err
 			}
-			if ipv4 := ipNet.IP.To4(); ipv4 != nil {
-				return ipv4.String()
+
+		case "step":
+			e.grid.SetHalo(msg.Halo)
+			e.grid.NextGeneration()
+			e.generation = msg.Generation
+			if err := e.sendState(ws); err != nil {
+				return err
 			}
+
+		case "reseed":
+			e.grid.SeedPattern()
+			if err := e.sendState(ws); err != nil {
+				return err
+			}
+
+		case "error":
+			log.Printf("Controller refused us: %s", msg.Reason)
+			// Back off hard for protocol errors so we don't hammer a controller
+			// that will keep saying no.
+			time.Sleep(reconnectMax)
+			return nil
 		}
 	}
-	return "localhost"
+}
+
+func (e *Engine) sendState(ws *websocket.Conn) error {
+	cells := make([][]bool, gameoflife.GridSize)
+	for i := range cells {
+		cells[i] = make([]bool, gameoflife.GridSize)
+		for j := range cells[i] {
+			cells[i][j] = bool(e.grid.Cells[i][j])
+		}
+	}
+	return e.write(ws, stateMsg{Type: "state", Generation: e.generation, Grid: cells})
+}
+
+func (e *Engine) write(ws *websocket.Conn, v interface{}) error {
+	ws.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return ws.WriteJSON(v)
 }
 
 func main() {
 	engine := NewEngine()
-	engine.Start()
-	
-	// Keep main alive
-	select {}
+	log.Printf("Engine %s starting → %s", engine.engineID, engine.controlURL)
+	engine.Run()
 }
