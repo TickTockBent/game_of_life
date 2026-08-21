@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/app.css?v=4">
+<link rel="stylesheet" href="/static/app.css?v=5">
 </head>
 <body class="stats-page">
 <header>
@@ -24,7 +24,7 @@
   <div class="tiles" id="tiles"></div>
   <h2>Engines</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Engine</th><th>Slot</th><th>Generation</th><th>Missed steps</th><th>State</th><th>Joined</th><th>Endpoint</th></tr></thead>
+    <thead><tr><th>Engine</th><th>Slot</th><th>Generation</th><th>Missed steps</th><th>State</th><th>Joined</th><th>Source</th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
   <div class="actions">
@@ -57,7 +57,7 @@
       const nodes=Object.entries(t.nodes||{}).sort((a,b)=>Number(a[0])-Number(b[0]));
       document.getElementById('rows').innerHTML=nodes.map(([pos,n])=>{
         const gen=(g.grids&&g.grids[pos]&&g.grids[pos].generation)||0;
-        return `<tr class="${n.lagging?'lag':''}"><td>${esc(n.displayName||n.podId)}</td><td>${n.position.row},${n.position.col}</td><td>${gen.toLocaleString()}</td><td>${n.missedSteps}</td><td>${n.lagging?'catching up':'in step'}</td><td>${ago(n.registeredAt)}</td><td>${esc(n.endpoint)}</td></tr>`;
+        return `<tr class="${n.lagging?'lag':''}"><td>${esc(n.displayName||n.podId)}</td><td>${n.position.row},${n.position.col}</td><td>${gen.toLocaleString()}</td><td>${n.missedSteps}</td><td>${n.lagging?'catching up':'in step'}</td><td>${ago(n.registeredAt)}</td><td>${n.public?'public':'house'}${n.connected===false?' · offline':''}</td></tr>`;
       }).join('')||'<tr><td colspan="7">No engines registered.</td></tr>';
     }catch(e){ document.getElementById('msg').textContent='Controller unreachable.'; }
   }

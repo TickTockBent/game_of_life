@@ -35,12 +35,15 @@ type Controller struct {
 	regionID          string
 
 	// Barrier sync state
-	readyEngines   map[int]bool  // tracks which engines are ready for current generation
-	barrierTimeout time.Duration // timeout for waiting for all engines
-	stepInterval   time.Duration // minimum time between steps (fixed tick)
-	lagThreshold   int           // missed steps before an engine is flagged lagging
-	staleThreshold int           // missed steps before an engine is removed
-	slotOrder      []int         // slot assignment order (centre-out spiral)
+	readyEngines    map[int]bool  // tracks which engines are ready for current generation
+	barrierTimeout  time.Duration // timeout for waiting for all engines
+	stepInterval    time.Duration // minimum time between steps (fixed tick)
+	lagThreshold    int           // missed steps before an engine is flagged lagging
+	staleThreshold  int           // missed steps before a *disconnected* engine's slot is freed
+	silentThreshold int           // missed steps before a connected-but-silent engine is dropped
+	slotOrder       []int         // slot assignment order (centre-out spiral)
+	maxEnginesPerIP int           // public engines allowed from one address
+	reservedSlots   int           // slots public engines may never take
 
 	// Debug controls
 	steppingPaused bool // When true, barrier coordinator won't auto-step
@@ -101,7 +104,9 @@ type NodeInfo struct {
 	MissedSteps   int         `json:"missedSteps"` // Count of consecutive missed state pushes
 	Lagging       bool        `json:"lagging"`     // True when the engine has missed recent steps; its section is stale
 	Connected     bool        `json:"connected"`   // False while the engine's socket is down (slot is held for it)
+	Public        bool        `json:"public"`      // Joined from outside the lab (via the tunnel)
 	Conn          *engineConn `json:"-"`
+	ClientIP      string      `json:"-"`
 }
 
 type Position struct {
@@ -120,11 +125,14 @@ type RegisterRequest struct {
 	Endpoint    string      `json:"endpoint"`
 	DisplayName string      `json:"displayName,omitempty"` // Optional user-friendly name
 	Conn        *engineConn `json:"-"`
+	ClientIP    string      `json:"-"`
+	Public      bool        `json:"-"`
 }
 
 type RegisterResponse struct {
-	Position   int   `json:"position"`
-	Generation int64 `json:"generation"`
+	Position   int    `json:"position"`
+	Generation int64  `json:"generation"`
+	Reason     string `json:"reason,omitempty"` // why Position is -1
 }
 
 type StateUpdateRequest struct {
@@ -229,8 +237,11 @@ func NewController() *Controller {
 		barrierTimeout:    durationFromEnv("BARRIER_TIMEOUT", 1000*time.Millisecond),
 		stepInterval:      durationFromEnv("STEP_INTERVAL", 250*time.Millisecond),
 		lagThreshold:      intFromEnv("LAG_THRESHOLD", 2),
-		staleThreshold:    intFromEnv("STALE_THRESHOLD", 40),
+		staleThreshold:    intFromEnv("STALE_THRESHOLD", 40),   // ~10s: socket gone, engine not back
+		silentThreshold:   intFromEnv("SILENT_THRESHOLD", 240), // ~60s: socket "open" but nothing arriving (dead residential link)
 		slotOrder:         spiralSlotOrder(gridCols, gridRows),
+		maxEnginesPerIP:   intFromEnv("MAX_ENGINES_PER_IP", 2),
+		reservedSlots:     intFromEnv("RESERVED_HOUSE_SLOTS", 10),
 		steppingPaused:    false,
 		wsClients:         make(map[*websocket.Conn]bool),
 		wsUpgrader: websocket.Upgrader{
@@ -309,12 +320,32 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 			node.Conn = req.Conn
 			node.Connected = req.Conn != nil
 			node.Endpoint = req.Endpoint
+			node.ClientIP = req.ClientIP
+			node.Public = req.Public
 			if req.DisplayName != "" {
 				node.DisplayName = req.DisplayName
 			}
 			node.LastHeartbeat = time.Now()
 			log.Printf("Engine %s reconnected at position %d", req.PodID, pos)
 			return RegisterResponse{Position: pos, Generation: atomic.LoadInt64(&c.currentGeneration)}
+		}
+	}
+
+	if req.Public {
+		publicCount, fromSameIP := 0, 0
+		for _, node := range c.nodes {
+			if node.Public {
+				publicCount++
+				if node.ClientIP == req.ClientIP {
+					fromSameIP++
+				}
+			}
+		}
+		if fromSameIP >= c.maxEnginesPerIP {
+			return RegisterResponse{Position: -1, Reason: fmt.Sprintf("too many engines from your address (max %d)", c.maxEnginesPerIP)}
+		}
+		if publicCount >= gridCols*gridRows-c.reservedSlots {
+			return RegisterResponse{Position: -1, Reason: "no public slots free right now — try again later"}
 		}
 	}
 
@@ -345,9 +376,11 @@ func (c *Controller) processRegister(req RegisterRequest) RegisterResponse {
 		LastHeartbeat: now,
 		Conn:          req.Conn,
 		Connected:     req.Conn != nil,
+		Public:        req.Public,
+		ClientIP:      req.ClientIP,
 	}
 
-	log.Printf("Registered engine %s at position %d", req.PodID, position)
+	log.Printf("Registered engine %s at position %d (public=%v)", req.PodID, position, req.Public)
 	return RegisterResponse{Position: position, Generation: atomic.LoadInt64(&c.currentGeneration)}
 }
 
@@ -648,7 +681,11 @@ func (c *Controller) updateMissedSteps() {
 // cleanupStaleEngines removes engines that have missed too many steps
 func (c *Controller) cleanupStaleEngines() {
 	for position, node := range c.nodes {
-		if node.MissedSteps >= c.staleThreshold {
+		limit := c.silentThreshold
+		if node.Conn == nil {
+			limit = c.staleThreshold
+		}
+		if node.MissedSteps >= limit {
 			log.Printf("Removing stale engine %s at position %d (missed %d steps)",
 				node.PodID, position, node.MissedSteps)
 			if node.Conn != nil {
@@ -1077,7 +1114,9 @@ func main() {
 	}()
 
 	log.Printf("Game of Life Controller with Channels starting on port %s (Region: %s)", port, controller.regionID)
-	log.Printf("Step interval %v, barrier timeout %v, lag after %d missed, remove after %d missed",
-		controller.stepInterval, controller.barrierTimeout, controller.lagThreshold, controller.staleThreshold)
+	log.Printf("Step interval %v, barrier timeout %v, lag after %d missed, free slot after %d missed (disconnected) / %d (silent)",
+		controller.stepInterval, controller.barrierTimeout, controller.lagThreshold, controller.staleThreshold, controller.silentThreshold)
+	log.Printf("Public engines: max %d per address, %d of %d slots reserved for house engines",
+		controller.maxEnginesPerIP, controller.reservedSlots, gridCols*gridRows)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), r))
 }

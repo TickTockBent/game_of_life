@@ -17,6 +17,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -37,7 +38,27 @@ const (
 	engineMaxMessageBytes = 8 * 1024
 	engineSendBuffer      = 8
 	maxDisplayNameRunes   = 32
+	maxStateMsgsPerSecond = 20 // a well-behaved engine sends ~4/s
 )
+
+// clientIdentity works out where an engine is connecting from. Anything that
+// arrived through Cloudflare carries CF-Connecting-IP and is "public";
+// anything else from a private address (the compose network, the LAN) is a
+// house engine.
+func clientIdentity(r *http.Request) (ip string, public bool) {
+	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+		return cf, true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	parsed := net.ParseIP(host)
+	if parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast()) {
+		return host, false
+	}
+	return host, true
+}
 
 var engineIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -201,6 +222,11 @@ func (c *Controller) handleEngineWS(w http.ResponseWriter, r *http.Request) {
 
 	conn := newEngineConn(ws, hello.EngineID)
 	go conn.writeLoop()
+	clientIP, public := clientIdentity(r)
+	endpoint := "ws://" + conn.remote
+	if public {
+		endpoint = "ws://public" // never publish a participant's IP
+	}
 
 	// 2. register on the processor goroutine
 	responseChan := make(chan RegisterResponse, 1)
@@ -209,14 +235,21 @@ func (c *Controller) handleEngineWS(w http.ResponseWriter, r *http.Request) {
 		Request: RegisterRequest{
 			PodID:       hello.EngineID,
 			DisplayName: sanitiseDisplayName(hello.DisplayName),
-			Endpoint:    "ws://" + conn.remote,
+			Endpoint:    endpoint,
 			Conn:        conn,
+			ClientIP:    clientIP,
+			Public:      public,
 		},
 		Response: responseChan,
 	}
 	reg := <-responseChan
 	if reg.Position < 0 {
-		conn.enqueue(ctrlSimple{Type: "error", Reason: "grid is full"})
+		reason := reg.Reason
+		if reason == "" {
+			reason = "grid is full"
+		}
+		log.Printf("Refused engine %s from %s: %s", hello.EngineID, clientIP, reason)
+		conn.enqueue(ctrlSimple{Type: "error", Reason: reason})
 		time.Sleep(200 * time.Millisecond)
 		conn.close()
 		return
@@ -233,12 +266,22 @@ func (c *Controller) handleEngineWS(w http.ResponseWriter, r *http.Request) {
 		ws.SetReadDeadline(time.Now().Add(engineReadTimeout))
 		return nil
 	})
+	windowStart := time.Now()
+	windowCount := 0
 	for {
 		_, data, err := ws.ReadMessage()
 		if err != nil {
 			break
 		}
 		ws.SetReadDeadline(time.Now().Add(engineReadTimeout))
+		// crude per-connection rate cap: drop, don't disconnect
+		if now := time.Now(); now.Sub(windowStart) >= time.Second {
+			windowStart, windowCount = now, 0
+		}
+		windowCount++
+		if windowCount > maxStateMsgsPerSecond {
+			continue
+		}
 		var msg engineStateMsg
 		if err := json.Unmarshal(data, &msg); err != nil || msg.Type != "state" {
 			continue
