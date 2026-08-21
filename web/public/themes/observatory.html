@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observatory · Distributed Life</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#eef0f6;--fg:#1b1f33;--rule:#cfd4e4;--muted:#9aa1bd;--accent:#3b5bdb;--card-bg:#fff;--card-fg:#1b1f33;--radius:10px;--sw-radius:50%;
+ --canvas-bg:#e4e7f1;--cell-dead:rgba(27,31,51,.06);--slot-empty:rgba(27,31,51,.18);--section-border:transparent;--owner-sat:62;--owner-light:46;
+ --display:'Instrument Serif',Georgia,serif;--body:'IBM Plex Sans',system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace;
+ --h1:400 1.6rem/1 var(--display);--h2:500 .7rem/1 var(--mono);--num:400 1.7rem/1 var(--display)}
+:root.is-dark{--bg:#070a18;--fg:#dfe3f5;--rule:#1c2240;--muted:#3a4470;--accent:#8fa5ff;--card-bg:#0f1430;--card-fg:#dfe3f5;
+ --canvas-bg:#0a0e22;--cell-dead:rgba(160,175,255,.05);--slot-empty:rgba(160,175,255,.16);--owner-sat:85;--owner-light:68}
+aside h2{letter-spacing:.12em;text-transform:uppercase}
+main{background:radial-gradient(ellipse at 50% 40%,color-mix(in oklab,var(--accent) 10%,transparent),transparent 70%)}
+#life{border-radius:14px;box-shadow:0 0 0 1px var(--rule),0 30px 80px -30px color-mix(in oklab,var(--accent) 40%,transparent)}
+
+/* ---- shared layout ---- */
+*,*::before,*::after{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);display:grid;grid-template-columns:1fr minmax(240px,300px);grid-template-rows:auto 1fr;min-height:100vh}
+header{grid-column:1/-1;display:flex;align-items:baseline;gap:1rem;padding:.9rem 1.4rem;border-bottom:1px solid var(--rule)}
+header h1{font:var(--h1);margin:0}
+header .sub{opacity:.65;font-size:.85rem}
+header .spacer{flex:1}
+#themeToggle{font:inherit;font-size:.8rem;background:none;border:1px solid var(--rule);color:inherit;padding:.3rem .7rem;border-radius:var(--radius);cursor:pointer}
+#themeToggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#conn{width:.55rem;height:.55rem;border-radius:50%;background:var(--muted);display:inline-block;align-self:center}
+#conn[data-state=live]{background:var(--accent)}
+main{position:relative;display:grid;place-items:center;padding:clamp(.5rem,3vw,2rem);min-height:0}
+#life{display:block;max-width:100%;cursor:crosshair}
+aside{border-left:1px solid var(--rule);padding:1.2rem 1.4rem;display:flex;flex-direction:column;gap:1.4rem;overflow:auto}
+aside h2{font:var(--h2);margin:0 0 .5rem;opacity:.7}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:.8rem 1rem}
+.stat b{display:block;font:var(--num)}
+.stat span{font-size:.75rem;opacity:.6}
+#participants{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.45rem}
+#participants li{display:flex;align-items:center;gap:.6rem;font-size:.88rem}
+#participants li.lag{opacity:.45}
+#participants .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#participants .ago{font-size:.72rem;opacity:.55;font-family:var(--mono)}
+#participants .none{opacity:.6}
+.sw{width:.7rem;height:.7rem;border-radius:var(--sw-radius,2px);display:inline-block;flex:none}
+#card[hidden]{display:none}
+#card{position:fixed;pointer-events:none;background:var(--card-bg);color:var(--card-fg);border:1px solid var(--rule);padding:.55rem .75rem;border-radius:var(--radius);font-size:.85rem;box-shadow:0 6px 24px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:.2rem;z-index:10}
+#card b{display:flex;align-items:center;gap:.5rem}
+#card small{opacity:.65;font-family:var(--mono);font-size:.72rem}
+.hint{font-size:.75rem;opacity:.55;line-height:1.4}
+@media (max-width:720px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}aside{border-left:0;border-top:1px solid var(--rule);flex-direction:row;flex-wrap:wrap}aside>*{flex:1 1 45%}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Observatory</h1>
+  <span class="sub">a distributed Game of Life, viewed from above</span>
+  <span class="spacer"></span>
+  <span id="conn" title="connection"></span>
+  <button id="themeToggle" type="button">Light / dark</button>
+</header>
+<main><canvas id="life" aria-label="Live Game of Life grid"></canvas></main>
+<aside>
+  <section><h2>Now</h2>
+    <div class="stats">
+      <div class="stat"><b id="gen">–</b><span>generation</span></div>
+      <div class="stat"><b id="rate">–</b><span>gen / s</span></div>
+      <div class="stat"><b id="engines">–</b><span>engines</span></div>
+      <div class="stat"><b id="cells">–</b><span>cells</span></div>
+    </div>
+  </section>
+  <section><h2>Computing this grid</h2><ul id="participants"></ul></section>
+  <p class="hint">Each glowing colony is one engine. Dim ones are catching up. Dotted rings are room to join. Click anywhere to reseed that engine.</p>
+</aside>
+<div id="card" hidden></div>
+<script src="/static/themes/life-core.js"></script>
+<script>LifeView.mount({
+  shape:'dot', gap:0.28, ringOfEmpty:1,
+  hue(n){ return 190 + ((this.rank(n) * 89) % 150); }, // cool spectrum: cyan→violet
+  aliveStyle(ctx,node,alpha,view){ return `hsla(${view.hue(node)},${view.tokens.sat}%,${view.tokens.light}%,${alpha})`; },
+  hoverStyle(ctx,x,y,s,node,view){ ctx.save(); ctx.strokeStyle=`hsla(${view.hue(node)},80%,70%,.8)`; ctx.lineWidth=1.5; ctx.strokeRect(x+1,y+1,s-2,s-2); ctx.restore(); }
+});
+</script>
+</body>
+</html>
