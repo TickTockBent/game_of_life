@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/app.css?v=3">
+<link rel="stylesheet" href="/static/app.css?v=4">
 </head>
 <body>
 <header>
@@ -16,7 +16,7 @@
   <span class="spacer"></span>
   <span id="conn" title="connection"></span>
   <nav>
-    <button id="colorToggle" type="button" class="ctl" aria-pressed="false"><span class="pip"></span>Colour by engine</button>
+    <button id="colorToggle" type="button" class="ctl" aria-pressed="false"><span class="pip"></span>Color by engine</button>
     <button id="themeToggle" type="button" class="ctl">Light / dark</button>
     <a class="ctl" href="/stats.html">Details</a>
   </nav>
@@ -35,7 +35,7 @@
   <p class="hint">Each outlined region is one engine's 7×7 section of a single shared grid. Faded regions are catching up. Dashed boxes are free slots. Hover a name to find its section; click a section to reseed it.</p>
 </aside>
 <div id="card" hidden></div>
-<script src="/static/life-core.js?v=5"></script>
+<script src="/static/life-core.js?v=6"></script>
 <script>LifeView.mount({
   shape:'square', gap:0.14, ringOfEmpty:1, fullBleed:true,
   // graph paper drawn on the same lattice as the cells: minor rule every cell, major every section

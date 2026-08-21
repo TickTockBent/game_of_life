@@ -75,14 +75,14 @@ aside h2{font:var(--h2);margin:0 0 .5rem;opacity:.7}
     </div>
   </section>
   <section><h2>Computing this grid</h2><ul id="participants"></ul></section>
-  <p class="hint">Cells are black or white, full stop. The coloured bar under each block says whose engine it is. Faded bars are catching up. Click to reseed.</p>
+  <p class="hint">Cells are black or white, full stop. The colored bar under each block says whose engine it is. Faded bars are catching up. Click to reseed.</p>
 </aside>
 <div id="card" hidden></div>
-<script src="/static/life-core.js?v=5"></script>
+<script src="/static/life-core.js?v=6"></script>
 <script>LifeView.mount({
   shape:'square', gap:0.12, ringOfEmpty:1,
   aliveStyle(ctx,node,alpha,view){ return view.tokens.dark ? `rgba(255,255,255,${alpha})` : `rgba(0,0,0,${alpha})`; },
-  // identity lives in a thick coloured underline per section, not in the cells
+  // identity lives in a thick colored underline per section, not in the cells
   drawSection(ctx,x,y,s,node,view){ ctx.save(); ctx.fillStyle=`hsla(${view.hue(node)},${view.tokens.sat}%,${view.tokens.light}%,${node.lagging?.3:1})`; ctx.fillRect(x+2,y+s-Math.max(2,s*0.035),s-4,Math.max(2,s*0.035)); ctx.restore(); },
   hoverStyle(ctx,x,y,s,node,view){ ctx.save(); ctx.strokeStyle=`hsl(${view.hue(node)},90%,50%)`; ctx.lineWidth=3; ctx.strokeRect(x+1.5,y+1.5,s-3,s-3); ctx.restore(); }
 });
