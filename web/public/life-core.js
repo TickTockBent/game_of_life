@@ -36,8 +36,8 @@
         shape: 'square',           // 'square' | 'dot' | 'rounded'
         minCell: 4,
         ringOfEmpty: 1,            // empty slots drawn around occupied bbox
-        fullBleed: false,          // canvas fills its container; grid centred with an offset
-        colorByOwner: false,       // tint cells per engine; off = single ink colour
+        fullBleed: false,          // canvas fills its container; grid centered with an offset
+        colorByOwner: false,       // tint cells per engine; off = single ink color
       }, config);
       try { const v = localStorage.getItem(COLOR_KEY); if (v !== null) view.colorByOwner = v === '1'; } catch (e) {}
       const forcedColor = new URLSearchParams(location.search).get('color');
@@ -127,7 +127,7 @@
     if (!data.grids || !data.topology) return;
     const prevGen = view.generation || 0;
     view.state.nodes = data.topology.nodes || {};
-    // stable join-order rank used for colour assignment
+    // stable join-order rank used for color assignment
     const ordered = Object.values(view.state.nodes).sort((a, b) =>
       (new Date(a.registeredAt) - new Date(b.registeredAt)) || (a.podId < b.podId ? -1 : 1));
     view.ranks = {}; ordered.forEach((n, i) => { view.ranks[n.podId] = i; });
