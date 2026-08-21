@@ -2,7 +2,9 @@ bin/
 controller
 engine
 *.md
+!web/public/**
 documentation/
 manifests/
 scripts/
 .git/
+.github/
