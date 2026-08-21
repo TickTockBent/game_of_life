@@ -407,12 +407,19 @@ func main() {
 	r := mux.NewRouter()
 
 	// Theme previews (design candidates for the UI rebuild)
-	r.PathPrefix("/themes/").Handler(http.StripPrefix("/themes/",
-		http.FileServer(http.Dir("static/public/themes/"))))
+	// While the UI is being iterated, never let browsers cache these.
+	noCache := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rw.Header().Set("Cache-Control", "no-cache, must-revalidate")
+			next.ServeHTTP(rw, r)
+		})
+	}
+	r.PathPrefix("/themes/").Handler(noCache(http.StripPrefix("/themes/",
+		http.FileServer(http.Dir("static/public/themes/")))))
 
 	// Serve static files
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", 
-		http.FileServer(http.Dir("static/public/"))))
+	r.PathPrefix("/static/").Handler(noCache(http.StripPrefix("/static/",
+		http.FileServer(http.Dir("static/public/")))))
 	
 	// API endpoints
 	r.HandleFunc("/api/topology", webServer.handleTopology).Methods("GET")
