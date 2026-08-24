@@ -112,15 +112,36 @@
   }
 
   // ---------- network ----------
+  // The feed delivers a frame every step (~250ms), so silence means the socket
+  // is dead even when the browser still thinks it's open — Cloudflare drops
+  // long-lived sockets without sending the client a close frame.
+  const FEED_SILENCE_LIMIT_MS = 8000;
+
   function connect(view) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
     const status = document.getElementById('conn');
+    view.ws = ws;
+    view.lastFrameAt = performance.now();
+    const feedIsStale = () => performance.now() - view.lastFrameAt > FEED_SILENCE_LIMIT_MS;
+    const watchdog = setInterval(() => { if (feedIsStale()) ws.close(); }, 2000);
+    if (!view.visibilityWatchWired) {
+      view.visibilityWatchWired = true;
+      // background tabs throttle timers; on return, recover instantly
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && view.ws && feedIsStale()) view.ws.close();
+      });
+    }
     ws.onopen = () => { if (status) status.dataset.state = 'live'; };
     ws.onmessage = (ev) => {
+      view.lastFrameAt = performance.now();
       try { ingest(view, JSON.parse(ev.data)); } catch (e) { console.error(e); }
     };
-    ws.onclose = () => { if (status) status.dataset.state = 'off'; setTimeout(() => connect(view), 2000); };
+    ws.onclose = () => {
+      clearInterval(watchdog);
+      if (status) status.dataset.state = 'off';
+      setTimeout(() => connect(view), 2000);
+    };
   }
 
   function ingest(view, data) {
