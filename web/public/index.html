@@ -12,7 +12,7 @@
 <body>
 <header>
   <h1>Distributed Life</h1>
-  <span class="sub">one engine per section, in lockstep</span>
+  <span class="sub">one engine per section</span>
   <span class="spacer"></span>
   <span id="conn" title="connection"></span>
   <nav>
@@ -34,7 +34,7 @@
   <section><h2>Computing this grid</h2><ul id="participants"></ul></section>
   <section class="join">
     <h2>Add your machine</h2>
-    <p class="join-lead">Anything that runs Docker — laptop, Pi, NAS — can compute a section. One command, nothing to open or configure; it connects outbound.</p>
+    <p class="join-lead">Anything that runs Docker such as a laptop, Pi, NAS can compute a section. Add it with one command, no configuration needed.</p>
     <label class="join-name">Shown as <input id="joinName" type="text" maxlength="32" placeholder="your name" autocomplete="off" spellcheck="false"></label>
     <div class="cmd"><code id="joinCmd"></code><button id="copyCmd" type="button" class="ctl">Copy</button></div>
     <p class="hint">Your section appears here within a few seconds. Stop it with <code>docker rm -f life</code>. Up to 2 engines per address.</p>
